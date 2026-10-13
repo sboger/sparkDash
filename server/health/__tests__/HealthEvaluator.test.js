@@ -35,6 +35,17 @@ test("low power needs a streak of consecutive gpu samples and resets", () => {
   assert.deepEqual(h.evaluate(m, "other"), []);
 });
 
+test("low power is never raised when the GPU does not report its own draw (Apple Silicon)", () => {
+  const h = new HealthEvaluator();
+  const m = { gpu: { usage: 97, power: { draw: 0 }, metricAvailability: { powerDraw: false } } };
+  for (let i = 0; i < LOW_POWER_STREAK + 2; i++) assert.deepEqual(h.evaluate(m, "gpu"), []);
+  // And a previously running streak resets once draw goes unavailable.
+  const busy = { gpu: { usage: 97, power: { draw: 9 } } };
+  for (let i = 0; i < LOW_POWER_STREAK - 1; i++) h.evaluate(busy, "gpu");
+  h.evaluate(m, "gpu");
+  assert.deepEqual(ids(h.evaluate(m, "other")), []);
+});
+
 test("memory: warn below 3 GB available, critical below 1.5 GB", () => {
   const h = new HealthEvaluator();
   const mk = (available) => ({ unifiedMemory: { total: 124000, available, percentage: 97 } });

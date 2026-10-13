@@ -74,6 +74,14 @@ export class HealthEvaluator {
   _lowPower(gpu, domain, out) {
     const util = num(gpu?.usage);
     const draw = num(gpu?.power?.draw);
+    // A GPU that does not report its own draw (Apple Silicon via macmon, or any
+    // adapter with powerDraw unavailable) has no honest draw number: 0 means
+    // "not measured", and "busy but unmeasured draw" is normal there, not a
+    // stuck power state.
+    if (gpu?.metricAvailability?.powerDraw === false) {
+      if (domain === "gpu") this._lowPowerStreak = 0;
+      return;
+    }
     if (util == null || draw == null) {
       if (domain === "gpu") this._lowPowerStreak = 0;
       return;
