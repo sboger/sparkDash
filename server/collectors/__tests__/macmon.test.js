@@ -93,11 +93,12 @@ test("collectGpu on a Mac unit reads macmon: scaled ratio × 100, °C, watts, no
   const gpu = await macCollector().collectGpu();
   assert.equal(gpu.temperature, 31.3);
   assert.equal(gpu.usage, 0.6); // gpu_scaled_ratio 0.006066… × 100, rounded to 0.1
-  assert.equal(gpu.power.draw, 0); // sub-centiwatt draw rounds to unavailable, not a fake 0 W
+  assert.equal(gpu.power.draw, 0); // the idle M6 GPU measures 0.0025 W, shown as 0 W like macmon's TUI
   assert.equal(gpu.power.limit, 0);
   assert.equal(gpu.metricAvailability.usage, true);
   assert.equal(gpu.metricAvailability.temperature, true);
-  assert.equal(gpu.metricAvailability.powerDraw, false);
+  assert.equal(gpu.metricAvailability.powerDraw, true); // a nonzero reading is a real measurement
+  assert.equal(gpu.metricAvailability.powerLimit, false);
   assert.equal(gpu.metricAvailability.vramTotal, false); // unified memory, not a discrete card
   assert.equal(gpu.vram.total, 0);
   assert.equal(gpu.nvErrNoMemory, 0);
@@ -195,7 +196,7 @@ test("the registry keeps platform darwin and the host kind the Add dialog set", 
   assert.equal(spark.hermesMonitoring, true); // Hermes checks stay available on macOS
 });
 
-test("GPU/CPU/ANE power of exactly 0 counts as unavailable, a real reading stays available", async () => {
+test("GPU/CPU power of exactly 0 counts as unavailable, a real reading stays available", async () => {
   const withPower = JSON.parse(SAMPLE);
   withPower.cpu_power = 4.2;
   withPower.gpu_power = 2.5;
@@ -207,6 +208,14 @@ test("GPU/CPU/ANE power of exactly 0 counts as unavailable, a real reading stays
   assert.equal(gpu.metricAvailability.powerDraw, true);
   const cpu = await c.collectCpu();
   assert.equal(cpu.draw, 4.2);
+  // A literal 0 is "counter unmeasured" (macmon's CLPC docs), never a 0 W GPU.
+  const broken = JSON.parse(SAMPLE);
+  broken.gpu_power = 0;
+  const c2 = macCollector();
+  c2._macRun = async () => ["__UPTIME__", "{ sec = 1728850000 }", "__MACMON__", JSON.stringify(broken)].join("\n");
+  const gpu2 = await c2.collectGpu();
+  assert.equal(gpu2.power.draw, 0);
+  assert.equal(gpu2.metricAvailability.powerDraw, false);
 });
 
 test("an unfinished macmon call is reused however old, a finished one only for ~1.2 s", () => {

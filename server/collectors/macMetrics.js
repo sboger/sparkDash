@@ -119,12 +119,10 @@ export function parseMacmonOutput(output) {
 }
 
 const pct = (ratio) => (Number.isFinite(ratio) ? Math.round(ratio * 1000) / 10 : null);
-const watts = (w) => {
-  if (!Number.isFinite(w) || w <= 0) return null;
-  const rounded = Math.round(w * 100) / 100;
-  // Sub-centiwatt draws round to 0: report unavailable rather than a fake "0 W".
-  return rounded > 0 ? rounded : null;
-};
+// A nonzero macmon reading is a real measurement, however small (an idle M6
+// GPU measures ~0.003 W at its minimum clock). Only an exact 0 means the
+// counter is unmeasured on this chip/macOS build (macmon's CLPC docs).
+const watts = (w) => (Number.isFinite(w) && w > 0 ? Math.round(w * 100) / 100 : null);
 const tempC = (t) => (Number.isFinite(t) && t > 0 && t < 150 ? Math.round(t * 10) / 10 : null);
 const mb = (bytes) => (Number.isFinite(bytes) && bytes > 0 ? Math.round(bytes / 1024 / 1024) : null);
 
