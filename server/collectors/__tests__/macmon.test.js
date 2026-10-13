@@ -94,11 +94,11 @@ test("collectGpu on a Mac unit reads macmon: scaled ratio × 100, °C, watts, no
   assert.equal(gpu.temperature, 31.3);
   assert.equal(gpu.usage, 0.6); // gpu_scaled_ratio 0.006066… × 100, rounded to 0.1
   assert.equal(gpu.power.draw, 0); // the idle M6 GPU measures 0.0025 W, shown as 0 W like macmon's TUI
-  assert.equal(gpu.power.limit, 0);
+  assert.equal(gpu.power.limit, 25); // nominal envelope: 12 GPU cores × 2 W, rounded to 5
   assert.equal(gpu.metricAvailability.usage, true);
   assert.equal(gpu.metricAvailability.temperature, true);
   assert.equal(gpu.metricAvailability.powerDraw, true); // a nonzero reading is a real measurement
-  assert.equal(gpu.metricAvailability.powerLimit, false);
+  assert.equal(gpu.metricAvailability.powerLimit, true); // nominal envelope reported
   assert.equal(gpu.metricAvailability.vramTotal, false); // unified memory, not a discrete card
   assert.equal(gpu.vram.total, 0);
   assert.equal(gpu.nvErrNoMemory, 0);

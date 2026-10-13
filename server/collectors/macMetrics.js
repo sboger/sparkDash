@@ -151,13 +151,17 @@ export function macmonGpu(sample) {
   const soc = sample.soc ?? null;
   const gpuCores = Number.isFinite(soc?.gpu_cores) ? soc.gpu_cores : null;
   const chip = typeof soc?.chip_name === "string" && soc.chip_name ? soc.chip_name : null;
+  // Apple publishes no GPU power limit. Nominal envelope ~2 W per GPU core
+  // (measured: an M6's 12-core GPU saturates at ~19-21 W sustained), rounded
+  // to 5 W, floor 15 W. An estimate, but the one the bar and caption need.
+  const nominalLimit = gpuCores ? Math.max(15, Math.round((gpuCores * 2) / 5) * 5) : null;
   const device = {
     index: 0,
     name: chip ? `${chip} GPU${gpuCores ? ` (${gpuCores} cores)` : ""}` : "Apple Silicon GPU",
     uuid: null,
     temperature: temp ?? 0,
     usage: usage ?? 0,
-    power: { draw: draw ?? 0, limit: 0 },
+    power: { draw: draw ?? 0, limit: nominalLimit ?? 0 },
     // Apple Silicon has no separate card memory: the unified pool is reported
     // through RAM/unified-memory, so VRAM availability stays off (UI shows "—").
     vram: { used: 0, total: 0, percentage: 0, available: 0 },
@@ -165,7 +169,7 @@ export function macmonGpu(sample) {
       temperature: temp != null,
       usage: usage != null,
       powerDraw: draw != null,
-      powerLimit: false,
+      powerLimit: nominalLimit != null,
       vramUsed: false,
       vramTotal: false,
     },
@@ -173,7 +177,7 @@ export function macmonGpu(sample) {
   return {
     temperature: temp ?? 0,
     usage: usage ?? 0,
-    power: { draw: draw ?? 0, limit: 0, systemDraw: null },
+    power: { draw: draw ?? 0, limit: nominalLimit ?? 0, systemDraw: null },
     sysPower: watts(sample.sys_power),
     throttle: null,
     metricAvailability: { ...device.metricAvailability },
