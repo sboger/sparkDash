@@ -22,8 +22,12 @@ const LINK_MIN_MBPS = 1000;
 const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
 
 export class HealthEvaluator {
-  constructor({ now = Date.now } = {}) {
+  constructor({ now = Date.now, lowPowerEnabled = true } = {}) {
     this._now = now;
+    /** Apple Silicon (and any unified-memory SoC) decodes LLM tokens at high
+     * residency and a few watts — "busy but low draw" is its normal decode
+     * shape, not stuck NVIDIA clocks. The rule is a discrete-GPU heuristic. */
+    this._lowPowerEnabled = lowPowerEnabled;
     this._lowPowerStreak = 0;
     this._kernel = { xid: null, oom: null };
     this._kernelAt = { xid: 0, oom: 0 };
@@ -72,6 +76,7 @@ export class HealthEvaluator {
   }
 
   _lowPower(gpu, domain, out) {
+    if (!this._lowPowerEnabled) return;
     const util = num(gpu?.usage);
     const draw = num(gpu?.power?.draw);
     // A GPU that does not report its own draw (Apple Silicon via macmon, or any

@@ -46,6 +46,14 @@ test("low power is never raised when the GPU does not report its own draw (Apple
   assert.deepEqual(ids(h.evaluate(m, "other")), []);
 });
 
+test("low power is disabled entirely for Apple Silicon units (busy-at-low-watts is normal decode shape)", () => {
+  const h = new HealthEvaluator({ lowPowerEnabled: false });
+  const m = { gpu: { usage: 97, power: { draw: 9 } } };
+  for (let i = 0; i < LOW_POWER_STREAK + 2; i++) assert.deepEqual(h.evaluate(m, "gpu"), []);
+  // Other rules still run on the same evaluator.
+  assert.equal(h.evaluate({ gpu: { temperature: 91 } })[0].severity, "critical");
+});
+
 test("memory: warn below 3 GB available, critical below 1.5 GB", () => {
   const h = new HealthEvaluator();
   const mk = (available) => ({ unifiedMemory: { total: 124000, available, percentage: 97 } });
