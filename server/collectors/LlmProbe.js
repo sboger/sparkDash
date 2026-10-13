@@ -103,7 +103,7 @@ export class LlmProbe {
     this._openTunnel = openSshLlmTunnel;
 
     // State
-    this.backendType = null; // 'vllm' | 'llama.cpp' | 'sglang' | 'lmstudio' | 'ollama' | 'ds4' | 'exl3' | 'q27' | 'tensorfold' | 'freetoken' | null
+    this.backendType = null; // 'vllm' | 'llama.cpp' | 'sglang' | 'lmstudio' | 'ollama' | 'ds4' | 'exl3' | 'q27' | 'tensorfold' | 'freetoken' | 'mlxvlm' | null
     this.serverIsOpenAI = null; // true = OpenAI-compatible
     /** Whether /v1/models (or /slots) answered without credentials. null = unknown. */
     this.authOpen = null;
@@ -507,7 +507,7 @@ export class LlmProbe {
    * Classify an OpenAI-compatible server: LM Studio, Ollama, ds4, SGLang,
    * EXL3, q27, TensorFold, FreeToken, or vLLM (default).
    * @param {unknown} ownedBy
-   * @returns {Promise<"lmstudio" | "ollama" | "ds4" | "sglang" | "exl3" | "q27" | "tensorfold" | "freetoken" | "vllm">}
+   * @returns {Promise<"lmstudio" | "ollama" | "ds4" | "sglang" | "exl3" | "q27" | "tensorfold" | "freetoken" | "mlxvlm" | "vllm">}
    */
   async _classifyOpenAIBackend(ownedBy) {
     // LM Studio first: it answers 200 + JSON on every path, so the heuristic
@@ -532,6 +532,7 @@ export class LlmProbe {
     if (await this._probeIsSglang()) return "sglang";
     if (await this._probeIsExl3()) return "exl3";
     if (await this._probeIsQ27()) return "q27";
+    if (await this._probeIsMlxVlm()) return "mlxvlm";
     if (await this._probeIsFreeToken()) return "freetoken";
     return "vllm";
   }
@@ -694,6 +695,36 @@ export class LlmProbe {
     );
   }
 
+  /**
+   * True when JSON /metrics matches mlx_vlm's server contract (`python -m
+   * mlx_vlm server`): a `summary` block with cumulative token totals and the
+   * live engine block. Specific enough that catch-all JSON servers
+   * (LM Studio) answering 200 on every path cannot misfire it.
+   */
+  async _probeIsMlxVlm() {
+    try {
+      const res = await this._fetch(`${this.baseUrl}/metrics`);
+      if (!res.ok) return false;
+      const data = await res.json().catch(() => null);
+      return LlmProbe._metricsLookLikeMlxVlm(data);
+    } catch {
+      return false;
+    }
+  }
+
+  /** @param {unknown} data */
+  static _metricsLookLikeMlxVlm(data) {
+    if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+    const summary = data.summary;
+    const server = data.server;
+    if (!summary || typeof summary !== "object" || !server || typeof server !== "object") return false;
+    return (
+      Number.isFinite(Number(summary.completion_tokens_total)) &&
+      Number.isFinite(Number(summary.prompt_tokens_total)) &&
+      Number.isFinite(Number(server.loaded_context_size))
+    );
+  }
+
   // ─── OpenAI-compatible path (vLLM/sglang/ds4) ────────────
   async _probeOpenAICompatible() {
     const now = Date.now();
@@ -792,6 +823,13 @@ export class LlmProbe {
       } catch {
         this._applyTensorFoldHealth(null, dtSec);
       }
+      return this._getSnapshot();
+    }
+
+    // mlx_vlm (`python -m mlx_vlm server`, Apple Silicon): JSON /metrics with
+    // a cumulative summary block and the live engine state.
+    if (this.backendType === "mlxvlm") {
+      await this._applyMlxVlmMetrics(dtSec);
       return this._getSnapshot();
     }
 
@@ -1435,6 +1473,69 @@ export class LlmProbe {
     const accepted = m("mtp_accepted_total");
     if (Number.isFinite(drafted) && drafted > 0 && Number.isFinite(accepted)) {
       this.mtpAcceptanceRate = Math.max(0, Math.min(1, accepted / drafted));
+    }
+  }
+
+  /**
+   * Apply mlx_vlm's JSON /metrics. `summary.completion_tokens_total` /
+   * `prompt_tokens_total` are cumulative over finished requests, so live
+   * tok/s comes from the delta between polls (same as vLLM/tensorfold);
+   * while a request is in flight (its tokens not yet counted) the last
+   * finished request's `decode_tok_s` keeps the tile live, and it expires
+   * when the queue drains. `summary.avg_decode_tok_s` is the lifetime
+   * average — never a live rate.
+   * @param {number} dtSec
+   */
+  async _applyMlxVlmMetrics(dtSec) {
+    let data;
+    try {
+      const res = await this._fetch(`${this.baseUrl}/metrics`);
+      if (!res.ok) return;
+      data = await res.json().catch(() => null);
+    } catch {
+      return;
+    }
+    if (!LlmProbe._metricsLookLikeMlxVlm(data)) return;
+    const summary = data.summary ?? {};
+    const server = data.server ?? {};
+
+    const ctx = Number(server.loaded_context_size);
+    if (Number.isFinite(ctx) && ctx > 0) this.contextLength = Math.round(ctx);
+
+    const gen = Number(summary.completion_tokens_total);
+    const prompt = Number(summary.prompt_tokens_total);
+    if (Number.isFinite(gen) && gen >= 0 && Number.isFinite(prompt) && prompt >= 0) {
+      const deltaOut = gen - this.lastTokenCounts.output;
+      const deltaIn = prompt - this.lastTokenCounts.input;
+      this.lastTokenCounts.input = prompt;
+      this.lastTokenCounts.output = gen;
+      this.totalOutputTokens = gen;
+      this.totalPromptTokens = prompt;
+      if (dtSec > 0 && dtSec < 10) {
+        this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
+        this.prefillTps = deltaIn > 0 ? Math.max(0, Math.round((deltaIn / dtSec) * 100) / 100) : 0;
+      }
+    }
+
+    const inFlight = Number(summary.in_flight);
+    const running = Number.isFinite(inFlight) && inFlight >= 0 ? Math.round(inFlight) : null;
+    this.requestsRunning = running;
+    if (running != null) this.slotsActive = running;
+    const queued = Number(server.request_queue_depth);
+    if (Number.isFinite(queued) && queued >= 0) this.requestsWaiting = Math.round(queued);
+
+    // A long in-flight generation has no counter delta yet; its expected rate
+    // is the last finished request's measured decode rate.
+    const latest = data.latest ?? {};
+    const latestDecode = Number(latest.decode_tok_s);
+    if (running != null && running > 0 && Number.isFinite(latestDecode) && latestDecode > 0) {
+      if (this.generationTps == null || this.generationTps === 0) {
+        this.generationTps = Math.round(latestDecode * 100) / 100;
+      }
+      const latestPrefill = Number(latest.prefill_tok_s);
+      if ((this.prefillTps == null || this.prefillTps === 0) && Number.isFinite(latestPrefill) && latestPrefill > 0) {
+        this.prefillTps = Math.round(latestPrefill * 100) / 100;
+      }
     }
   }
 
