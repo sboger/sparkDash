@@ -22,15 +22,20 @@ describe("unit type", () => {
     expect(unitTypeOf({})).toBe("spark");
     expect(unitTypeOf({ kind: "host" })).toBe("host");
     expect(unitTypeOf({ kind: "host", platform: "windows" })).toBe("windows");
+    expect(unitTypeOf({ kind: "host", platform: "darwin" })).toBe("mac");
   });
 
   it("a Windows PC is a remote GPU host", () => {
     expect(unitTypePatch("windows", {})).toEqual({ kind: "host", platform: "windows", isLocal: false });
   });
 
-  it("switching back to Spark or Linux host clears the Windows platform and keeps macOS", () => {
+  it("a Mac (Apple Silicon) is a remote GPU host on darwin", () => {
+    expect(unitTypePatch("mac", {})).toEqual({ kind: "host", platform: "darwin", isLocal: false });
+  });
+
+  it("switching back to Spark or Linux host clears the special platforms", () => {
     expect(unitTypePatch("spark", { platform: "windows" })).toEqual({ kind: "spark", platform: "linux" });
     expect(unitTypePatch("host", { platform: "windows" })).toEqual({ kind: "host", platform: "linux" });
-    expect(unitTypePatch("host", { platform: "darwin" })).toEqual({ kind: "host", platform: "darwin" });
+    expect(unitTypePatch("spark", { platform: "darwin" })).toEqual({ kind: "spark", platform: "linux" });
   });
 });

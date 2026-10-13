@@ -12,6 +12,17 @@ import {
   splitWindowsGpuOutput,
   windowsGpuAsLinuxOutput,
 } from "./windowsMetrics.js";
+import {
+  MACMON_SCRIPT,
+  MAC_UPTIME_SCRIPT,
+  MAC_NETWORK_SCRIPT,
+  parseMacUptime,
+  parseMacNetwork,
+  splitMacmonSections,
+  macmonGpu,
+  macmonCpu,
+  macmonRam,
+} from "./macMetrics.js";
 
 const NVERR_JOURNAL_CMD =
   'journalctl -k --no-pager -q --grep=NV_ERR_NO_MEMORY 2>/dev/null | grep -c NV_ERR_NO_MEMORY || true';
@@ -314,7 +325,9 @@ export class SystemCollector {
           ? this._withoutUnmeteredProcesses(
               await this._getRemoteGpu(async () => windowsGpuAsLinuxOutput(await this._windowsRun("gpu", WINDOWS_GPU_SCRIPT)))
             )
-          : await this._getRemoteGpu();
+          : this.isMac
+            ? await this._getMacGpu()
+            : await this._getRemoteGpu();
       return tagCollectionResult(gpuData, this._isSuccessfulGpuCollection(gpuData));
     } catch (err) {
       console.error(`[SystemCollector] GPU error for ${this.spark.id}:`, err.message);
@@ -329,8 +342,15 @@ export class SystemCollector {
       if (!this.spark.isLocal) {
         const cpuData = this.isWindows
           ? await this._getWindowsCpu(collectionSequence)
-          : await this._getRemoteCpu(collectionSequence);
-        return tagCollectionResult(cpuData, this._isSuccessfulCpuCollection(cpuData));
+          : this.isMac
+            ? await this._getMacCpu()
+            : await this._getRemoteCpu(collectionSequence);
+        return tagCollectionResult(
+          cpuData,
+          this.isMac
+            ? Number.isFinite(cpuData?.usage) && cpuData.usage >= 0 && cpuData.usage <= 100
+            : this._isSuccessfulCpuCollection(cpuData)
+        );
       }
 
       // Read /proc/stat once and compute usage BEFORE estimating power.
@@ -415,7 +435,7 @@ export class SystemCollector {
   async collectRam() {
     if (!this.spark.isLocal) {
       if (this.isWindows) return this._getWindowsRam();
-      if (this.isMac) return this._getRemoteRamMac();
+      if (this.isMac) return (await this._getMacRam()) ?? this._getRemoteRamMac();
       return this._getRemoteRam();
     }
     try {
@@ -443,7 +463,11 @@ export class SystemCollector {
 
   /** Collect network metrics (interfaces, speeds). */
   async collectNetwork() {
-    if (!this.spark.isLocal) return this.isWindows ? this._getWindowsNetwork() : this._getRemoteNetwork();
+    if (!this.spark.isLocal) {
+      if (this.isWindows) return this._getWindowsNetwork();
+      if (this.isMac) return this._getMacNetwork();
+      return this._getRemoteNetwork();
+    }
     try {
       const interfaces = this._tagDisabledInterfaces(await this._getNetworkMetrics());
       let primaryInterface = await this._getDefaultNetworkInterface();
@@ -2219,6 +2243,151 @@ export class SystemCollector {
     }
   }
 
+  // ─── Mac units (platform: "darwin") ───────────────────────
+  /**
+   * One macmon SSH round trip per script, shared by every domain that asks for
+   * it within ~1.2 s (same shape as the Windows cache; a macmon sample blocks
+   * for its interval, so calls are never stacked either).
+   */
+  _macRun(key, script) {
+    const now = Date.now();
+    this._macCache ??= new Map();
+    const hit = this._macCache.get(key);
+    if (hit && (!hit.settled || now - hit.at < 1200)) return hit.promise;
+    const entry = { at: now, settled: false, promise: null };
+    entry.promise = sshExec(this.spark, script, { timeoutMs: 15000 });
+    // Attach (don't chain): entry.promise must stay the sshExec promise itself,
+    // so callers receive the command output, not the bookkeeping callback's void.
+    entry.promise.then(
+      () => {
+        entry.settled = true;
+        entry.at = Date.now();
+      },
+      () => {
+        entry.settled = true;
+        if (this._macCache.get(key) === entry) this._macCache.delete(key);
+      }
+    );
+    this._macCache.set(key, entry);
+    return entry.promise;
+  }
+
+  /** Latest macmon sample ({ uptime, sample }) or nulls when macmon is absent/failing. */
+  async _macSample() {
+    try {
+      return splitMacmonSections(await this._macRun("metrics", MACMON_SCRIPT));
+    } catch (err) {
+      console.error(`[SystemCollector] macmon error for ${this.spark.id}:`, err.message);
+      return { uptime: null, sample: null };
+    }
+  }
+
+  /** Apple Silicon GPU: usage/temp/power from macmon; VRAM unavailable (unified pool). */
+  async _getMacGpu() {
+    const { sample } = await this._macSample();
+    const parsed = macmonGpu(sample);
+    if (!parsed) return this._defaultGpu();
+    return {
+      temperature: parsed.temperature,
+      usage: parsed.usage,
+      power: { draw: parsed.power.draw, limit: parsed.power.limit, systemDraw: parsed.sysPower ?? 0 },
+      vram: { used: 0, total: 0, percentage: 0, available: 0 },
+      processes: [],
+      throttle: this._defaultThrottle(),
+      nvErrNoMemory: 0,
+      kernelErrors: null,
+      gpus: parsed.gpus,
+      vendors: [],
+      metricAvailability: parsed.metricAvailability,
+    };
+  }
+
+  /** Apple Silicon CPU/GPU/ANE power and temps via macmon (no TDP is published). */
+  async _getMacCpu() {
+    const { sample } = await this._macSample();
+    return macmonCpu(sample) ?? this._defaultCpu();
+  }
+
+  /** Unified RAM from the same macmon sample; null → caller falls back to sysctl. */
+  async _getMacRam() {
+    const { sample } = await this._macSample();
+    return macmonRam(sample);
+  }
+
+  /** macOS uptime via kern.boottime (SparkMonitor's liveness poll). */
+  async readMacUptime() {
+    try {
+      return parseMacUptime(await sshExec(this.spark, MAC_UPTIME_SCRIPT, { timeoutMs: 8000 }));
+    } catch (err) {
+      console.error(`[SystemCollector] macOS uptime error for ${this.spark.id}:`, err.message);
+      return null;
+    }
+  }
+
+  /**
+   * macOS interfaces from netstat -ibn: counters map to the same
+   * lastNetworkStats delta the Windows/Linux paths use for byte speeds.
+   */
+  async _getMacNetwork() {
+    try {
+      const { primaryInterface, interfaces } = parseMacNetwork(
+        await this._macRun("network", MAC_NETWORK_SCRIPT)
+      );
+      const now = Date.now();
+      const withSpeeds = interfaces.map((iface) => {
+        const last = this.lastNetworkStats.get(iface.name) || { rxBytes: iface.rxBytes, txBytes: iface.txBytes, time: now };
+        const dt = (now - last.time) / 1000;
+        const rx = dt > 0 ? (iface.rxBytes - last.rxBytes) / dt : 0;
+        const tx = dt > 0 ? (iface.txBytes - last.txBytes) / dt : 0;
+        this.lastNetworkStats.set(iface.name, { rxBytes: iface.rxBytes, txBytes: iface.txBytes, time: now });
+        return {
+          ...iface,
+          rxSpeed: Math.max(0, Math.round(rx)),
+          txSpeed: Math.max(0, Math.round(tx)),
+        };
+      });
+      const tagged = this._tagDisabledInterfaces(withSpeeds);
+      let primary = tagged.some((i) => i.name === primaryInterface) ? primaryInterface : null;
+      primary ??= tagged.find((i) => i.operstate === "up")?.name ?? null;
+      if (primary && (this.spark.disabledInterfaces || []).includes(primary)) {
+        primary = tagged.find((i) => !i.disabled)?.name ?? primary;
+      }
+      return { primaryInterface: primary, linkSpeedMbps: null, interfaces: tagged, wolMac: null };
+    } catch (err) {
+      console.error(`[SystemCollector] macOS network error for ${this.spark.id}:`, err.message);
+      return this._defaultNetwork();
+    }
+  }
+
+  /**
+   * Header specs from macmon's --soc-info block (chip name, core counts, GPU
+   * cores, RAM). Returns null so the caller keeps its fallback summary when
+   * macmon is missing or too old to report the soc block.
+   */
+  async detectMacHardware() {
+    try {
+      const { sample } = await this._macSample();
+      const soc = sample?.soc;
+      if (!soc) return null;
+      const cpuCores =
+        (Number.isFinite(soc.pcpu_cores) ? soc.pcpu_cores : 0) +
+        (Number.isFinite(soc.ecpu_cores) ? soc.ecpu_cores : 0);
+      const chip = typeof soc.chip_name === "string" && soc.chip_name ? soc.chip_name : null;
+      return {
+        device: "Mac (Apple Silicon)",
+        cpuModel: chip,
+        cpuCores: cpuCores > 0 ? cpuCores : null,
+        totalMemoryGB: Number.isFinite(soc.memory_gb) && soc.memory_gb > 0 ? soc.memory_gb : null,
+        gpuChip: chip ? `${chip} GPU${soc.gpu_cores ? ` (${soc.gpu_cores} cores)` : ""}` : null,
+        gpuCount: 1,
+        cudaDriver: null,
+        storageModel: null,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   // ─── Windows units (platform: "windows") ──────────────────
   get isWindows() {
     return this.spark.platform === "windows";
@@ -2721,7 +2890,7 @@ export class SystemCollector {
    */
   /** Xid / OOM-kill counters since boot (cached; journal scans are slow). null when unreadable. */
   async _kernelErrors() {
-    if (this.isWindows) return null; // no kernel journal; unreadable, not "zero errors"
+    if (this.isWindows || this.isMac) return null; // no kernel journal; unreadable, not "zero errors"
     const now = Date.now();
     if (this._kernelErrCache.at > 0 && now - this._kernelErrCache.at < POLL_INTERVAL_NVERR) {
       return this._kernelErrCache.value;
@@ -2747,7 +2916,7 @@ export class SystemCollector {
   }
 
   async _nvErrNoMemory() {
-    if (this.isWindows) return 0;
+    if (this.isWindows || this.isMac) return 0;
     const now = Date.now();
     if (this._nvErrCache.at > 0 && now - this._nvErrCache.at < POLL_INTERVAL_NVERR) {
       return this._nvErrCache.count;

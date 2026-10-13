@@ -490,6 +490,18 @@ sparkDash then runs two short PowerShell scripts over SSH per poll (no files are
 
 ---
 
+## Mac (Apple Silicon)
+
+A Mac with Apple Silicon (M1–M6) is monitored through [macmon](https://github.com/vladkens/macmon), a sudoless CLI that reads the same private IOReport/IOHID counters `powermetrics` uses. On the Mac:
+
+1. Install macmon: `brew install macmon` (or a binary release on `PATH`; `/usr/local/bin/macmon` and `/opt/homebrew/bin/macmon` are also found).
+2. Enable **Remote Login** (Settings → General → Sharing) so sparkDash can SSH in, and put the dashboard host's key in `~/.ssh/authorized_keys`. No sudo is needed — on macOS 27 even `sudo` would not help, the counters are entitlement-gated, not user-gated.
+3. In sparkDash choose **Add Spark / GPU host**, set **Unit type** to *Mac (Apple Silicon, via macmon)*, and enter the Mac's LAN IP, SSH user and LLM ports.
+
+Each poll runs one short SSH round trip: `macmon pipe --soc-info -s 1 -i 300` for GPU/CPU usage (frequency-weighted), GPU/CPU/ANE/system power (watts), CPU/GPU temperature, fans and unified memory, plus `sysctl` for uptime, `df`/`netstat`/`route` for storage and network. The header shows the chip (`soc.chip_name`, e.g. *Apple M6 GPU (12 cores)*). LLM servers on the Mac (llama.cpp, Ollama, LM Studio) are probed over HTTP as for any unit. Not available: a power limit (macOS publishes no package TDP; the UI shows "—"), separate VRAM (the GPU shares unified memory, reported under RAM), model launchers (bash/systemd) and disk read/write speed. A power reading of 0 is reported as unavailable — on unmapped chips/macOS builds macmon's CLPC counters can read 0, which means *not measured*, not 0 W.
+
+---
+
 ## LLM server presets & backend auto-detection
 
 ### Server presets

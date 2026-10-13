@@ -6,25 +6,32 @@ export function deviceKindNoun(kind: SparkConfig["kind"]): "Spark" | "GPU Host" 
 }
 
 /** The choices in the Unit type select. */
-export type UnitType = "spark" | "host" | "windows";
+export type UnitType = "spark" | "host" | "windows" | "mac";
 
 export const UNIT_TYPE_OPTIONS: { value: UnitType; label: string }[] = [
   { value: "spark", label: "NVIDIA DGX Spark" },
   { value: "host", label: "Dedicated GPU host (Linux, nvidia-smi, not a Spark)" },
   { value: "windows", label: "Windows PC (NVIDIA GPU or AMD Strix Halo)" },
+  { value: "mac", label: "Mac (Apple Silicon, via macmon)" },
 ];
 
 export function unitTypeOf(config: Pick<SparkConfig, "kind" | "platform">): UnitType {
   if (config.platform === "windows") return "windows";
+  if (config.platform === "darwin") return "mac";
   return config.kind === "host" ? "host" : "spark";
 }
 
 /** Config fields to set when the Unit type select changes. */
 export function unitTypePatch(type: UnitType, current: Pick<SparkConfig, "platform">): Partial<SparkConfig> {
   if (type === "windows") return { kind: "host", platform: "windows", isLocal: false };
-  // Keep a macOS platform set through the API; everything else is plain Linux.
-  const platform = current.platform === "darwin" ? "darwin" : "linux";
-  return { kind: type, platform };
+  if (type === "mac") return { kind: "host", platform: "darwin", isLocal: false };
+  // Everything else is plain Linux.
+  return { kind: type, platform: "linux" };
+}
+
+/** True when the metrics collectors need SSH (no local in-process collectors). */
+export function isSshOnlyPlatform(platform: SparkConfig["platform"]): boolean {
+  return platform === "windows" || platform === "darwin";
 }
 
 /** Label for the final "add" button in the Add dialog. */

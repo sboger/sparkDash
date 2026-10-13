@@ -14,7 +14,7 @@ import {
   validateConnect,
   type AddStep,
 } from "./addSparkSteps";
-import { addDeviceLabel, UNIT_TYPE_OPTIONS, unitTypeOf, unitTypePatch, type UnitType } from "../shared/deviceKind";
+import { addDeviceLabel, UNIT_TYPE_OPTIONS, unitTypeOf, unitTypePatch, isSshOnlyPlatform, type UnitType } from "../shared/deviceKind";
 import { TestResultList } from "./TestResultList";
 import { resolveSparkRole } from "../api/sparkRole";
 import type { SparkRole } from "../api/types";
@@ -242,7 +242,7 @@ export function AddSparkDialog({ open, onClose, onAdded, defaultLlmPort = 8888 }
                 </select>
               </div>
 
-              {config.platform !== "windows" && (
+              {!isSshOnlyPlatform(config.platform) && (
                 <label className="check-row">
                   <input
                     type="checkbox"
@@ -256,6 +256,13 @@ export function AddSparkDialog({ open, onClose, onAdded, defaultLlmPort = 8888 }
                 <p className="field-hint">
                   Needs the Windows OpenSSH Server and the NVIDIA driver (nvidia-smi). Metrics come from
                   PowerShell over SSH; Hermes and Tailnet checks are not available for Windows.
+                </p>
+              )}
+              {config.platform === "darwin" && (
+                <p className="field-hint">
+                  Metrics come from macmon over SSH (install with `brew install macmon`); no sudo needed.
+                  GPU, CPU, power and thermal readings use Apple Silicon counters; LLM ports are probed
+                  over HTTP like any other host.
                 </p>
               )}
 
