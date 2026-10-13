@@ -267,7 +267,7 @@ export function SparkPage({
                 sparkId={spark.id}
                 temperatureUnit={temperatureUnit}
                 chip={spark.hardware.gpuChip}
-                hideMemory={showUnified}
+                hideMemory={showUnified || spark.platform === "darwin"}
               />
             </Item>
             {/* Unified memory (or RAM on a dedicated host) and CPU sit side by side (they stack when the column is narrow). */}

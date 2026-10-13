@@ -109,7 +109,16 @@ function SparkCardImpl({
   const memColor = memPct >= 90 ? "var(--color-danger)" : memPct >= 85 ? "var(--color-warning)" : "var(--color-info)";
   const tempColor = tempRaw > 80 ? "var(--color-danger)" : tempRaw >= 75 ? "var(--color-warning)" : "var(--color-success)";
   const power = gpu?.power;
-  const powerPct = power && power.limit > 0 ? (power.draw / power.limit) * 100 : 0;
+  // macOS publishes no package power limit (macmon has no TDP), so the bar
+  // scales against a nominal envelope instead of sitting empty; the caption
+  // still shows the real draw with "—" for the limit.
+  const POWER_NOMINAL_W = 100;
+  const powerPct =
+    power && power.limit > 0
+      ? (power.draw / power.limit) * 100
+      : gpu?.metricAvailability?.powerDraw !== false && power
+        ? Math.min(100, (power.draw / POWER_NOMINAL_W) * 100)
+        : 0;
 
   const rootDisk =
     spark.metrics.storage.find((d) => d.label === "/") ?? spark.metrics.storage.find((d) => d.device === "nvme0n1p2");
@@ -255,21 +264,22 @@ function SparkCardImpl({
         <>
           <div className="ov-sc__body">
             <div className="ov-sc__stats">
-              {breakdown ? (
-                <VramBreakdownBar
-                  label={breakdown.systemMB != null ? "Unified memory" : "VRAM"}
-                  breakdown={breakdown}
-                  showLegend
-                />
-              ) : (
-                <Bar
-                  label={gpu.vram?.total ? "VRAM" : "Unified memory"}
-                  caption={vramAvailable && memTotal > 0 ? `${fmtStorage(memUsed, false)} / ${fmtStorage(memTotal, true)}` : "—"}
-                  pct={vramAvailable ? memPct : 0}
-                  color={memColor}
-                  sub={memTotal > 0 && memAvail > 0 ? { label: "Available", value: formatMb(memAvail) } : null}
-                />
-              )}
+              {spark.platform !== "darwin" &&
+                (breakdown ? (
+                  <VramBreakdownBar
+                    label={breakdown.systemMB != null ? "Unified memory" : "VRAM"}
+                    breakdown={breakdown}
+                    showLegend
+                  />
+                ) : (
+                  <Bar
+                    label={gpu.vram?.total ? "VRAM" : "Unified memory"}
+                    caption={vramAvailable && memTotal > 0 ? `${fmtStorage(memUsed, false)} / ${fmtStorage(memTotal, true)}` : "—"}
+                    pct={vramAvailable ? memPct : 0}
+                    color={memColor}
+                    sub={memTotal > 0 && memAvail > 0 ? { label: "Available", value: formatMb(memAvail) } : null}
+                  />
+                ))}
               <Bar label="GPU" caption={gpu.metricAvailability?.usage === false ? "—" : `${Math.round(usage)}%`} pct={gpu.metricAvailability?.usage === false ? 0 : usage} color={ringColor} />
               {spark.kind === "host" && spark.metrics.ram?.total ? (
                 <Bar
