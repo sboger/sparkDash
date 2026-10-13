@@ -510,7 +510,11 @@ export class SystemCollector {
 
   /** Collect unified memory metrics. */
   async collectUnifiedMemory() {
-    if (!this.spark.isLocal) return this.isWindows ? this._getWindowsUnifiedMemory() : this._getRemoteUnifiedMemory();
+    if (!this.spark.isLocal) {
+      if (this.isWindows) return this._getWindowsUnifiedMemory();
+      if (this.isMac) return this._getMacUnifiedMemory();
+      return this._getRemoteUnifiedMemory();
+    }
     try {
       return await this._getUnifiedMemory();
     } catch (err) {
@@ -2321,6 +2325,42 @@ export class SystemCollector {
     } catch (err) {
       console.error(`[SystemCollector] macOS uptime error for ${this.spark.id}:`, err.message);
       return null;
+    }
+  }
+
+  /**
+   * macOS unified memory from the macmon sample: the GPU shares the system
+   * pool and llama.cpp does not report a per-process share, so everything
+   * counts as system use (the detail page shows the plain RAM panel for
+   * darwin hosts; this only keeps the metric honest in the API).
+   */
+  async _getMacUnifiedMemory() {
+    try {
+      const { sample } = await this._macSample();
+      const ram = macmonRam(sample);
+      if (!ram) return this._getRemoteRamMac().then((r) => ({
+        total: r.total,
+        gpuUsed: 0,
+        cpuUsed: r.used,
+        used: r.used,
+        available: Math.max(0, r.total - r.used),
+        percentage: r.percentage,
+        oomRisk: r.percentage > 85 ? "high" : r.percentage > 60 ? "medium" : "low",
+        bandwidth: { current: 0, peak: 0 },
+      }));
+      return {
+        total: ram.total,
+        gpuUsed: 0,
+        cpuUsed: ram.used,
+        used: ram.used,
+        available: Math.max(0, ram.total - ram.used),
+        percentage: ram.percentage,
+        oomRisk: ram.percentage > 85 ? "high" : ram.percentage > 60 ? "medium" : "low",
+        bandwidth: { current: 0, peak: 0 },
+      };
+    } catch (err) {
+      console.error(`[SystemCollector] macOS unified memory error for ${this.spark.id}:`, err.message);
+      return this._defaultUnifiedMemory();
     }
   }
 

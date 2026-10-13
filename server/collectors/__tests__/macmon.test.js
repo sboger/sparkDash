@@ -165,6 +165,16 @@ test("macOS network parsing keeps physical interfaces, their IPs and drops the v
   assert.equal(net.interfaces[0].operstate, "up");
 });
 
+test("unified memory on a Mac comes from the macmon block, not /proc/meminfo", async () => {
+  const c = macCollector();
+  const mem = await c.collectUnifiedMemory();
+  assert.equal(mem.total, 16384);
+  assert.equal(mem.used, 10968);
+  assert.equal(mem.cpuUsed, 10968); // no per-process GPU share is reportable
+  assert.equal(mem.gpuUsed, 0);
+  assert.equal(mem.oomRisk, "medium");
+});
+
 test("the registry keeps platform darwin and the host kind the Add dialog set", () => {
   const registry = Object.create(SparkRegistry.prototype);
   const spark = registry._normalizeConfig({
