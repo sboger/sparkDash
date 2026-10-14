@@ -250,3 +250,14 @@ test("the remote GPU probe runs to the end under a zsh login shell", { skip: spa
   assert.doesNotMatch(run.stderr, /no matches found/);
   assert.match(run.stdout, /__MEMINFO__/);
 });
+
+test("the amd-smi resolver has no unquoted shell glob (zsh aborts on an unmatched one)", async () => {
+  const collector = new SystemCollector({ id: "worker", isLocal: false, kind: "spark" });
+  let command = "";
+  await collector._getRemoteGpu(async (_spark, cmd) => { command = cmd; return ""; });
+  const resolver = command.slice(command.indexOf("amd_smi="), command.indexOf("amd_smi=") + 600);
+  assert.match(resolver, /amd-smi/);
+  // Drop single- and double-quoted spans; whatever remains is what the login shell globs.
+  const unquoted = resolver.replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, '""');
+  assert.doesNotMatch(unquoted, /[*?]/);
+});
