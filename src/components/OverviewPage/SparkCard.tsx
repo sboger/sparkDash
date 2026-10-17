@@ -184,9 +184,9 @@ function SparkCardImpl({
   const showTps = role !== "worker" && !!llm;
   const llmChip = llm
     ? llm.requestsRunning != null
-      ? `${llm.requestsRunning} running · ${llm.requestsWaiting ?? 0} queued`
+      ? `${llm.requestsRunning} running · ${llm.requestsWaiting == null ? "queue unknown" : `${llm.requestsWaiting} queued`}`
       : llm.slotsTotal > 0
-        ? `${llm.slotsActive}/${llm.slotsTotal} slots`
+        ? `${llm.slotsActive ?? "?"}/${llm.slotsTotal} slots`
         : null
     : null;
 
@@ -196,6 +196,11 @@ function SparkCardImpl({
         <Tag tone="warn" title={throttle.detail || "GPU clock throttled"}>
           {throttle.thermal ? "Thermal throttle" : "HW slowdown"}
           {throttle.smClockMHz ? ` · SM ${(throttle.smClockMHz / 1000).toFixed(1)} GHz` : ""}
+        </Tag>
+      ) : null}
+      {online && throttle?.clockCapMHz != null ? (
+        <Tag title="GPU clock locked with nvidia-smi -lgc">
+          Cap {(throttle.clockCapMHz / 1000).toFixed(1)} GHz
         </Tag>
       ) : null}
       {online && llmChip ? <Tag tone={(llm?.requestsRunning ?? llm?.slotsActive ?? 0) > 0 ? "good" : "neutral"}>{llmChip}</Tag> : null}

@@ -4,7 +4,9 @@ import childProcess from "child_process";
 import { HOST_PATHS, GPU_MEMORY_JSON_PATH, DGX_SPARK, HARDWARE_DEFAULTS, POLL_INTERVAL_NVERR } from "../config.js";
 import { normalizeMac, WOL_INTERFACE } from "../wol.js";
 import { sshExec } from "./ssh.js";
+import { getSettings } from "../settings.js";
 import { RoceSampler } from "./roce.js";
+import { IntelSudoGate, IntelVramCache, buildIntelProbeScript, parseIntelProbe, sampleIntelCards } from "./intelGpu.js";
 import {
   WINDOWS_GPU_SCRIPT,
   WINDOWS_SYSTEM_SCRIPT,
@@ -52,6 +54,36 @@ export function parseKernelErrors(raw) {
   return { xid, oomKills, lastXid };
 }
 
+// nvidia-smi / NVML cannot read back a `nvidia-smi -lgc` lock (no getter
+// exists; clocks.max.* is the hardware max). Whoever sets the lock drops a
+// one-line marker "<maxMHz> [<boot_id>]" so the dashboard can show it. A
+// boot_id that no longer matches means the box rebooted and the lock is gone.
+export const CLOCK_CAP_FILES = [
+  "/run/sparkdash/gpu-clock-cap",
+  "$HOME/.config/sparkdash/gpu-clock-cap",
+];
+const CLOCK_CAP_CMD =
+  `cat ${CLOCK_CAP_FILES.join(" ")} 2>/dev/null | head -1; cat /proc/sys/kernel/random/boot_id 2>/dev/null || true`;
+
+/**
+ * Parse CLOCK_CAP_CMD output (marker line, then the current boot_id).
+ * Exported for tests. Returns the locked max graphics clock in MHz, or null.
+ * @param {unknown} raw
+ * @returns {number|null}
+ */
+export function parseClockCap(raw) {
+  const lines = String(raw ?? "").split("\n").map((l) => l.trim()).filter(Boolean);
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const capLine = lines.find((l) => /^\d+(\s|$)/.test(l)); // first token must be wholly numeric — a bare boot_id line (e.g. "139dcc9e-…") starts with digits and must NOT parse as a cap
+  if (!capLine) return null;
+  const [mhzRaw, markerBoot] = capLine.split(/\s+/);
+  const mhz = Number.parseInt(mhzRaw, 10);
+  if (!Number.isFinite(mhz) || mhz <= 0) return null;
+  const currentBoot = lines.filter((l) => uuid.test(l)).pop();
+  if (markerBoot && currentBoot && markerBoot.toLowerCase() !== currentBoot.toLowerCase()) return null;
+  return mhz;
+}
+
 /**
  * Parse `grep -c` stdout into a non-negative integer. Exported for tests.
  * @param {unknown} raw
@@ -68,6 +100,18 @@ export const COLLECTION_SUCCESS = Symbol("sparkdash.collectionSuccess");
 
 export function collectionWasSuccessful(result) {
   return result?.[COLLECTION_SUCCESS] === true;
+}
+
+const NVIDIA_SIDE_FAILED = Symbol("sparkdash.nvidiaSideFailed");
+
+/** True when nvidia-smi is installed but gave no devices on a host that has an Intel card. */
+export function nvidiaSideFailed(result) {
+  return result?.[NVIDIA_SIDE_FAILED] === true;
+}
+
+function markNvidiaSideFailed(result, failed) {
+  if (failed) Object.defineProperty(result, NVIDIA_SIDE_FAILED, { value: true, enumerable: false, configurable: true });
+  return result;
 }
 
 /** Convert amd-smi JSON output into the collector's per-device GPU shape. */
@@ -129,7 +173,33 @@ export function parseAmdSmiMetrics(raw, limitRaw = null) {
   });
 }
 
-const REMOTE_GPU_SECTIONS = new Set(["NVIDIA", "NVIDIA_VRAM", "NVIDIA_APPS", "AMD", "AMD_LIMITS", "MEMINFO"]);
+/**
+ * Locate and run macmon on a macOS unit. Non-interactive SSH sessions get a minimal
+ * PATH, so Homebrew and cargo locations are tried explicitly. MACMON_PATH overrides.
+ */
+const MACMON_CANDIDATES = [
+  process.env.MACMON_PATH,
+  "/opt/homebrew/bin/macmon",
+  "/usr/local/bin/macmon",
+  "$HOME/.cargo/bin/macmon",
+].filter(Boolean);
+export const MACMON_CMD =
+  `for m in ${MACMON_CANDIDATES.map((p) => (p.startsWith("$HOME") ? `"${p}"` : `'${p.replace(/'/g, `'\\''`)}'`)).join(" ")} "$(command -v macmon 2>/dev/null)"; do ` +
+  'if [ -n "$m" ] && [ -x "$m" ]; then "$m" pipe -s 1 -i 200; exit 0; fi; done; echo NO_MACMON';
+
+/** Last JSON line of `macmon pipe` output, parsed; null when absent or malformed. */
+export function parseMacmonSample(output) {
+  const line = String(output ?? "").trim().split("\n").filter((l) => l.trim().startsWith("{")).pop();
+  if (!line) return null;
+  try {
+    const j = JSON.parse(line);
+    return j && typeof j === "object" ? j : null;
+  } catch {
+    return null;
+  }
+}
+
+const REMOTE_GPU_SECTIONS = new Set(["NVIDIA", "NVIDIA_VRAM", "NVIDIA_APPS", "AMD", "AMD_LIMITS", "INTEL", "MEMINFO", "CLOCK_CAP"]);
 
 /**
  * Split the remote GPU probe output into named sections. A section starts at a
@@ -157,11 +227,14 @@ const AMD_GPU_FIELDS = ["temperature", "usage", "powerDraw", "powerLimit", "vram
 const AMD_SMI_RESOLVER = [
   'amd_smi="${AMD_SMI_PATH:-}"',
   'if [ -z "$amd_smi" ] || [ ! -x "$amd_smi" ]; then amd_smi="$(command -v amd-smi 2>/dev/null || true)"; fi',
-  'if [ -z "$amd_smi" ]; then for amd_candidate in "${ROCM_PATH:+$ROCM_PATH/bin/amd-smi}" "${ROCM_HOME:+$ROCM_HOME/bin/amd-smi}" /opt/rocm/bin/amd-smi /opt/rocm/core-*/bin/amd-smi /opt/rocm-*/bin/amd-smi; do if [ -x "$amd_candidate" ]; then amd_smi="$amd_candidate"; break; fi; done; fi',
+  // Versioned ROCm dirs come from find, not a shell glob: the remote login shell
+  // may be zsh, where an unmatched glob aborts the whole probe (no matches found).
+  'if [ -z "$amd_smi" ]; then for amd_candidate in "${ROCM_PATH:+$ROCM_PATH/bin/amd-smi}" "${ROCM_HOME:+$ROCM_HOME/bin/amd-smi}" /opt/rocm/bin/amd-smi $(find /opt -maxdepth 4 \\( -path \'/opt/rocm/core-*/bin/amd-smi\' -o -path \'/opt/rocm-*/bin/amd-smi\' \\) 2>/dev/null | sort); do if [ -x "$amd_candidate" ]; then amd_smi="$amd_candidate"; break; fi; done; fi',
 ].join("; ");
 // Keep vendor namespaces disjoint so collection failures cannot make AMD reuse
 // an NVIDIA device's index in per-card histories or Prometheus labels.
 const AMD_GPU_INDEX_OFFSET = 1000;
+const INTEL_GPU_INDEX_OFFSET = 2000;
 
 function tagCollectionResult(result, successful) {
   Object.defineProperty(result, COLLECTION_SUCCESS, {
@@ -273,6 +346,14 @@ export class SystemCollector {
 
     // GPU VRAM per-PID cache
     this.nvidiaComputeAppsCache = new Map();
+    // Intel (xe) energy / idle-residency baselines per PCI address
+    this._intelState = new Map();
+    // Remembers a failed `sudo -n` VRAM read so it is not retried every poll
+    this._intelSudo = new IntelSudoGate();
+    // Last debugfs VRAM reading, so working `sudo -n` runs once per window, not per poll
+    this._intelVram = new IntelVramCache();
+    // Whether any xe-driver card exists on this host (local path), re-checked rarely
+    this._intelPresent = { value: null, at: 0 };
 
     // Cached hardware info
     this._hardwareInfo = null;
@@ -328,7 +409,7 @@ export class SystemCollector {
           : this.isMac
             ? await this._getMacGpu()
             : await this._getRemoteGpu();
-      return tagCollectionResult(gpuData, this._isSuccessfulGpuCollection(gpuData));
+      return tagCollectionResult(gpuData, this._isSuccessfulGpuCollection(gpuData) && !nvidiaSideFailed(gpuData));
     } catch (err) {
       console.error(`[SystemCollector] GPU error for ${this.spark.id}:`, err.message);
       return tagCollectionResult(this._defaultGpu(), false);
@@ -525,21 +606,28 @@ export class SystemCollector {
 
   // ─── GPU helpers ─────────────────────────────────────────
   async _getGPUAll() {
-    const [gpuOut, amd] = await Promise.all([
+    const vramRead = this._intelVram.stale;
+    const [gpuOut, amd, clockCapMHz, intelOut] = await Promise.all([
       this._nvidiaSmi(
         "--query-gpu=temperature.gpu,utilization.gpu,power.draw,power.limit,clocks.current.sm,clocks.max.sm,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.sw_thermal_slowdown,clocks_throttle_reasons.hw_slowdown,clocks_throttle_reasons.sw_power_cap,index,name,uuid --format=csv,noheader,nounits"
-      ).catch(() => ""),
+      ).catch(() => null),
       this._probeLocalAmd(),
+      this._readLocalClockCap(),
+      this._probeIntelLocal(vramRead),
     ]);
-    const nvidiaDevices = this._parseGpuLines(gpuOut);
-    const amdDevices = amd.devices;
+    const nvidiaDevices = this._parseGpuLines(gpuOut ?? "");
+    this._applyClockCap(nvidiaDevices, clockCapMHz);
+    const intelDevices = this._intelDevices(this._sampleIntel(intelOut, vramRead));
+    const otherDevices = [...amd.devices, ...intelDevices];
+    // nvidia-smi failing is normal on a host without NVIDIA; installed-but-failing next to an Intel card is not.
+    const nvidiaFailed = gpuOut === null && intelDevices.length > 0 && (await this._nvidiaSmiInstalled());
     this._lastVramPerDevice = [];
     const nvidiaVram = nvidiaDevices.length ? await this._queryNvidiaVram() : { used: 0, total: 0, percentage: 0, available: 0 };
-    const amdVram = this._sumDeviceVram(amdDevices);
-    const devices = [...nvidiaDevices, ...amdDevices];
+    const otherVram = this._sumDeviceVram(otherDevices);
+    const devices = [...nvidiaDevices, ...otherDevices];
     const gpu = this._aggregateGpuDevices(devices);
     if (!nvidiaDevices.length) this.nvidiaComputeAppsCache.clear();
-    const vram = this._combineVram(nvidiaVram, amdVram);
+    const vram = this._combineVram(nvidiaVram, otherVram);
 
     // Estimate total system power: GPU draw + CPU draw + ~20W CX7/peripherals
     let systemDraw = gpu.powerDraw;
@@ -554,7 +642,7 @@ export class SystemCollector {
     const apps = this._cachedApps();
     const processes = this._topProcesses(apps);
 
-    return {
+    return markNvidiaSideFailed({
       temperature: gpu.temperature,
       usage: gpu.usage,
       power: { draw: gpu.powerDraw, limit: gpu.powerLimit, systemDraw },
@@ -565,7 +653,7 @@ export class SystemCollector {
       kernelErrors: await this._kernelErrors(),
       gpus: [
         ...this._buildGpuDevices(nvidiaDevices, this._lastVramPerDevice ?? [], apps, nvidiaVram),
-        ...amdDevices,
+        ...otherDevices,
       ],
       vendors: [...new Set(devices.map((device) => device.vendor))],
       metricAvailability: {
@@ -573,7 +661,22 @@ export class SystemCollector {
         vramUsed: devices.some((device) => device.metricAvailability?.vramUsed !== false),
         vramTotal: devices.some((device) => device.metricAvailability?.vramTotal !== false),
       },
-    };
+    }, nvidiaFailed);
+  }
+
+  /** Whether nvidia-smi exists on the host. Cached for 10 minutes; only asked when it just failed. */
+  async _nvidiaSmiInstalled() {
+    const c = (this._nvidiaInstalled ??= { value: null, at: 0 });
+    const now = Date.now();
+    if (c.value != null && now - c.at < 10 * 60 * 1000) return c.value;
+    let found = false;
+    try {
+      found = String(await this._execOnHost("command -v nvidia-smi 2>/dev/null")).trim() !== "";
+    } catch {
+      found = false;
+    }
+    this._nvidiaInstalled = { value: found, at: now };
+    return found;
   }
 
   /**
@@ -595,6 +698,115 @@ export class SystemCollector {
       devices: parseAmdSmiMetrics(metricsOut, limitsOut)
         .map((device) => ({ ...device, index: AMD_GPU_INDEX_OFFSET + device.index })),
     };
+  }
+
+  /** Intel (xe) probe on this host, in the host mount namespace. "" when unavailable. */
+  async _probeIntelLocal(vram = true) {
+    if (process.platform !== "linux") return "";
+    if (!this._hasXeCard()) return "";
+    try {
+      return await this._execOnHost(buildIntelProbeScript({ sudo: this._intelSudo.allowed && getSettings().intelVramSudo, vram }));
+    } catch {
+      return "";
+    }
+  }
+
+  /** Where sysfs may be mounted: the host bind mount in the container, else /sys. */
+  _sysRoots() {
+    return [HOST_PATHS.SYS, "/sys"];
+  }
+
+  /**
+   * Whether an `xe`-driver card is present, read from sysfs without spawning
+   * anything. Cached; re-checked every 10 minutes so a hot-added card is found
+   * eventually. A failed read counts as "maybe" and is not cached.
+   */
+  _hasXeCard() {
+    const c = this._intelPresent;
+    const now = Date.now();
+    if (c.value != null && now - c.at < 10 * 60 * 1000) return c.value;
+    try {
+      const root = this._sysRoots()
+        .map((r) => path.join(r, "class/drm"))
+        .find((d) => fs.existsSync(d));
+      let found = false;
+      if (root) {
+        for (const name of fs.readdirSync(root)) {
+          if (!/^card\d+$/.test(name)) continue;
+          try {
+            if (path.basename(fs.readlinkSync(path.join(root, name, "device/driver"))) === "xe") {
+              found = true;
+              break;
+            }
+          } catch {
+            // no driver bound
+          }
+        }
+      }
+      this._intelPresent = { value: found, at: now };
+      return found;
+    } catch {
+      return true;
+    }
+  }
+
+  /** Probe output -> sampled Intel cards (power and usage from counter deltas). [] when none. */
+  _sampleIntel(probeOut, vramRead = true) {
+    const cards = parseIntelProbe(probeOut);
+    this._intelSudo.observe(cards);
+    this._intelVram.apply(cards, vramRead);
+    const { devices, next } = sampleIntelCards(cards, this._intelState);
+    this._intelState = next;
+    return devices.map((d) => ({
+      ...d,
+      throttle: this._buildThrottle({ smClockMHz: d.smClockMHz, smClockMaxMHz: d.smClockMaxMHz }),
+    }));
+  }
+
+  /**
+   * Sampled Intel cards as finished devices, the same shape parseAmdSmiMetrics
+   * returns, in their own index range. Missing numbers are reported as
+   * unavailable instead of zero: no power cap file means no power limit, and a
+   * card whose VRAM usage could not be read (debugfs not readable) only knows
+   * its PCI BAR size.
+   */
+  _intelDevices(sampled) {
+    return sampled.map((d, i) => {
+      const measured = d.vramSource === "debugfs";
+      const used = measured ? d.vramUsedMB : 0;
+      const total = d.vramTotalMB;
+      return {
+        index: INTEL_GPU_INDEX_OFFSET + i,
+        physicalIndex: i,
+        name: d.name,
+        uuid: null,
+        vendor: "intel",
+        pci: d.pci,
+        temperature: d.temperature,
+        usage: d.usage,
+        powerDraw: d.powerDraw,
+        powerLimit: d.powerLimit,
+        power: { draw: d.powerDraw, limit: d.powerLimit },
+        vram: {
+          used,
+          total,
+          percentage: total > 0 ? Math.round((used / total) * 100) : 0,
+          available: Math.max(0, total - used),
+        },
+        fanRpm: d.fanRpm ?? null,
+        vramSource: d.vramSource,
+        metricAvailability: {
+          temperature: d.temperature > 0,
+          usage: true,
+          powerDraw: true,
+          powerLimit: d.powerLimit > 0,
+          vramUsed: measured,
+          vramTotal: total > 0,
+        },
+        throttle: d.throttle,
+        processes: [],
+      };
+    });
   }
 
   _sumDeviceVram(devices) {
@@ -1003,8 +1215,50 @@ export class SystemCollector {
       smClockMHz,
       smClockMaxMHz,
       smClockPct,
+      clockCapMHz: null,
       detail: details.length ? details.join(" · ") : "Clocks not limited",
     };
+  }
+
+  /** Stamp a `nvidia-smi -lgc` cap (MHz or null) onto each device's throttle. */
+  _applyClockCap(devices, capMHz) {
+    if (capMHz == null) return;
+    for (const d of devices) {
+      if (!d.throttle) continue;
+      d.throttle.clockCapMHz = capMHz;
+      const note = `Clock locked ≤ ${capMHz} MHz`;
+      d.throttle.detail =
+        d.throttle.detail === "Clocks not limited" ? note : `${d.throttle.detail} · ${note}`;
+    }
+  }
+
+  /**
+   * Local-host twin of CLOCK_CAP_CMD: read the marker and boot_id directly.
+   * In Docker the marker lives on the host, so the host root mount is tried too.
+   */
+  async _readLocalClockCap({ root = HOST_PATHS.ROOT, own = true } = {}) {
+    const home = process.env.HOME || "";
+    const user = String(this.spark?.ssh?.user || "");
+    const files = own ? CLOCK_CAP_FILES.map((f) => f.replace("$HOME", home)) : [];
+    if (root) {
+      files.push(path.join(root, "run/sparkdash/gpu-clock-cap"));
+      if (/^[a-z_][a-z0-9_-]{0,31}$/i.test(user)) {
+        files.push(path.join(root, "home", user, ".config/sparkdash/gpu-clock-cap"));
+      }
+    }
+    let marker = "";
+    for (const f of files) {
+      try {
+        marker = (await fs.promises.readFile(f, "utf8")).split("\n")[0];
+        if (marker.trim()) break;
+      } catch {}
+    }
+    if (!marker.trim()) return null;
+    let boot = "";
+    try {
+      boot = await fs.promises.readFile("/proc/sys/kernel/random/boot_id", "utf8");
+    } catch {}
+    return parseClockCap(`${marker}\n${boot}`);
   }
 
   _defaultThrottle() {
@@ -1614,10 +1868,13 @@ export class SystemCollector {
   // ─── Remote collection via SSH ────────────────────────────
   async _getRemoteGpu(executor = sshExec) {
     try {
+      const vramRead = this._intelVram.stale;
       const cmd = [
         "if command -v nvidia-smi >/dev/null 2>&1; then printf '\\n__NVIDIA__\\n'; nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,power.draw,power.limit,clocks.current.sm,clocks.max.sm,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.sw_thermal_slowdown,clocks_throttle_reasons.hw_slowdown,clocks_throttle_reasons.sw_power_cap,index,name,uuid --format=csv,noheader,nounits 2>/dev/null; printf '\\n__NVIDIA_VRAM__\\n'; nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null; printf '\\n__NVIDIA_APPS__\\n'; nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory,gpu_uuid --format=csv,noheader,nounits 2>/dev/null; fi",
         `${AMD_SMI_RESOLVER}; if [ -n "$amd_smi" ]; then printf '\\n__AMD__\\n'; "$amd_smi" metric -u -p -m -t --json 2>/dev/null; printf '\\n__AMD_LIMITS__\\n'; "$amd_smi" static -l --json 2>/dev/null; fi`,
+        `printf '\\n__INTEL__\\n'; ${buildIntelProbeScript({ sudo: this._intelSudo.allowed && getSettings().intelVramSudo, vram: vramRead })}`,
         "printf '\\n__MEMINFO__\\n'; grep -E 'MemTotal|MemAvailable' /proc/meminfo 2>/dev/null",
+        `printf '\\n__CLOCK_CAP__\\n'; ${CLOCK_CAP_CMD}`,
       ].join("; ");
 
       const output = await executor(this.spark, cmd);
@@ -1628,23 +1885,31 @@ export class SystemCollector {
       const computeOut = section("NVIDIA_APPS");
       const amdMetrics = section("AMD");
       const amdLimits = section("AMD_LIMITS");
+      const intelOut = section("INTEL");
       const meminfoOut = section("MEMINFO");
       // Keep compatibility with existing injected executor fixtures and older command results.
       const legacy = !("MEMINFO" in sections);
       const legacySections = legacy ? String(output).split("---") : [];
       const resolvedMeminfo = legacy ? (legacySections[3] || "").trim() : meminfoOut;
+      const clockCapOut = section("CLOCK_CAP");
       const cliDevices = this._parseGpuLines(legacy ? (legacySections[0] || "") : gpuOut, {
         source: this.isWindows ? "windows" : "nvidia",
       });
+      this._applyClockCap(cliDevices, parseClockCap(clockCapOut));
       const perDeviceVram = this._parseVramLines(legacy ? (legacySections[1] || "") : memFields);
       const apps = this._parseComputeApps(legacy ? (legacySections[2] || "") : computeOut);
       const amdDevices = legacy ? [] : parseAmdSmiMetrics(amdMetrics, amdLimits)
         .map((device) => ({ ...device, index: AMD_GPU_INDEX_OFFSET + device.index }));
-      const gpuDevices = [...cliDevices, ...amdDevices];
+      // Probe output only exists in the section format; legacy fixtures carry no Intel data.
+      const intelDevices = this._intelDevices(this._sampleIntel(legacy ? "" : intelOut, vramRead));
+      const otherDevices = [...amdDevices, ...intelDevices];
+      // The NVIDIA section is only printed when nvidia-smi is installed. Installed but no devices,
+      // next to an Intel card, means a broken NVIDIA side, not an Intel-only host.
+      const nvidiaFailed = !legacy && "NVIDIA" in sections && cliDevices.length === 0 && intelDevices.length > 0;
+      const gpuDevices = [...cliDevices, ...otherDevices];
       const gpu = this._aggregateGpuDevices(gpuDevices);
       if (!gpuDevices.length) return this._defaultGpu();
       let { used: cliUsed, total: cliTotal } = this._sumVram(perDeviceVram);
-
       this.nvidiaComputeAppsCache.clear();
       let computeSum = 0;
       for (const app of apps) {
@@ -1658,9 +1923,9 @@ export class SystemCollector {
       }
       if ((cliUsed == null || cliUsed === 0) && computeSum > 0) cliUsed = computeSum;
 
-      const amdVram = this._sumDeviceVram(amdDevices);
+      const otherVram = this._sumDeviceVram(otherDevices);
       const cliVram = { used: cliUsed || 0, total: cliTotal || 0, available: Math.max(0, (cliTotal || 0) - (cliUsed || 0)) };
-      const combinedVram = this._combineVram(cliVram, amdVram);
+      const combinedVram = this._combineVram(cliVram, otherVram);
 
       // Unified-memory pool: prefer MemTotal (OS-visible) so VRAM and Unified
       // Memory panels share the same base. Available = MemAvailable (real free).
@@ -1682,7 +1947,7 @@ export class SystemCollector {
           total: resolvedTotal,
           available: availMatch ? availableMB : Math.max(0, resolvedTotal - Math.round(cliUsed || 0)),
         };
-        totalMB = resolvedTotal + Math.round(amdVram.total || 0);
+        totalMB = resolvedTotal + Math.round(otherVram.total || 0);
       }
       if (this.spark.kind === "host") {
         // Discrete GPU VRAM: trust vendor-reported memory. Unknown capacity
@@ -1697,9 +1962,9 @@ export class SystemCollector {
       } else {
         // GB10 shared HBM pool: prefer the OS-visible pool (MemTotal) as the total,
         // fall back to nvidia-smi, then the hardware spec (HBM) only if nothing known.
-        if (cliDevices.length && memTotalMB > 0) totalMB = memTotalMB + Math.round(amdVram.total || 0);
+        if (cliDevices.length && memTotalMB > 0) totalMB = memTotalMB + Math.round(otherVram.total || 0);
         else if (cliDevices.length && totalMB <= 0) totalMB = DGX_SPARK.MEMORY_HBM_SIZE_GB * 1024;
-        if (!cliDevices.length && amdDevices.length) availableMB = Math.round(amdVram.available || 0);
+        if (!cliDevices.length && otherDevices.length) availableMB = Math.round(otherVram.available || 0);
       }
       const percentage = totalMB > 0 ? Math.round((usedMB / totalMB) * 100) : 0;
 
@@ -1721,7 +1986,7 @@ export class SystemCollector {
       const processes = this._topProcesses(cachedApps);
       const vram = { used: usedMB, total: totalMB, percentage, available: availableMB };
 
-      return {
+      return markNvidiaSideFailed({
         temperature: gpu.temperature,
         usage: gpu.usage,
         power: { draw: gpu.powerDraw, limit: gpu.powerLimit, systemDraw },
@@ -1732,7 +1997,7 @@ export class SystemCollector {
         kernelErrors: await this._kernelErrors(),
         gpus: [
           ...this._buildGpuDevices(cliDevices, perDeviceVram, cachedApps, resolvedCliVram),
-          ...amdDevices,
+          ...otherDevices,
         ],
         vendors: [...new Set(gpuDevices.map((device) => device.vendor))],
         metricAvailability: {
@@ -1740,7 +2005,7 @@ export class SystemCollector {
           vramUsed: gpuDevices.some((device) => device.metricAvailability?.vramUsed !== false),
           vramTotal: gpuDevices.some((device) => device.metricAvailability?.vramTotal !== false),
         },
-      };
+      }, nvidiaFailed);
     } catch (err) {
       console.error(`[SystemCollector] Remote GPU error for ${this.spark.id}:`, err.message);
       return this._defaultGpu();
@@ -1959,6 +2224,147 @@ export class SystemCollector {
    */
   get isMac() {
     return this.spark.platform === "darwin";
+  }
+
+  // ─── macOS via macmon ────────────────────────────────────
+  // macmon (github.com/vladkens/macmon) reads Apple Silicon CPU/GPU/power/temperature
+  // without sudo. One sample feeds the GPU, CPU, RAM and unified-memory polls (cached
+  // 1.5 s), so a Mac costs one SSH call per cycle. Without macmon on the host these
+  // collectors fall back to defaults (RAM keeps the sysctl/memory_pressure reader).
+  _macmonSample(executor = sshExec) {
+    const now = Date.now();
+    if (this._macmon && now - this._macmon.at < this._macmon.ttl) return this._macmon.promise;
+    const promise = executor(this.spark, MACMON_CMD).then((out) => {
+      const sample = parseMacmonSample(out);
+      if (!sample) {
+        // A Mac without macmon is re-checked once a minute (and logged once), not on every poll.
+        if (/NO_MACMON/.test(String(out ?? ""))) {
+          const err = new Error("macmon not found on host (install it, or set MACMON_PATH)");
+          err.macmonMissing = true;
+          throw err;
+        }
+        throw new Error("macmon returned no sample");
+      }
+      return sample;
+    });
+    const entry = { at: now, promise, ttl: 1500 };
+    this._macmon = entry;
+    promise.catch((err) => {
+      if (this._macmon !== entry) return;
+      if (err?.macmonMissing) {
+        entry.ttl = 60_000;
+        console.error(`[SystemCollector] ${this.spark.id}: ${err.message}`);
+      } else {
+        this._macmon = null;
+      }
+    });
+    return promise;
+  }
+
+  _logMacmonError(kind, err) {
+    if (err?.macmonMissing) return;
+    console.error(`[SystemCollector] macmon ${kind} error for ${this.spark.id}:`, err.message);
+  }
+
+  async _getRemoteGpuMac() {
+    try {
+      const j = await this._macmonSample();
+      const r1 = (n) => Math.round((Number(n) || 0) * 10) / 10;
+      const temperature = r1(j.temp?.gpu_temp_avg);
+      const usage = Math.round((Number(j.gpu_usage?.[1]) || 0) * 100);
+      const draw = r1(j.gpu_power);
+      const total = Math.round((Number(j.memory?.ram_total) || 0) / 1048576);
+      const used = Math.round((Number(j.memory?.ram_usage) || 0) / 1048576);
+      const vram = {
+        used,
+        total,
+        percentage: total > 0 ? Math.round((used / total) * 100) : 0,
+        available: Math.max(0, total - used),
+      };
+      const metricAvailability = {
+        temperature: temperature > 0,
+        usage: true,
+        powerDraw: true,
+        powerLimit: false,
+        vramUsed: total > 0,
+        vramTotal: total > 0,
+      };
+      const throttle = this._defaultThrottle();
+      const device = {
+        vendor: "apple",
+        index: 0,
+        physicalIndex: 0,
+        name: "Apple GPU",
+        uuid: null,
+        temperature,
+        usage,
+        power: { draw, limit: 0 },
+        vram,
+        throttle,
+        processes: [],
+        metricAvailability,
+      };
+      return {
+        temperature,
+        usage,
+        power: { draw, limit: 0, systemDraw: Math.round(Number(j.sys_power) || 0) },
+        vram,
+        processes: [],
+        throttle,
+        nvErrNoMemory: 0,
+        vendor: "apple",
+        vendors: ["apple"],
+        metricAvailability,
+        gpus: [device],
+      };
+    } catch (err) {
+      this._logMacmonError("GPU", err);
+      return this._defaultGpu();
+    }
+  }
+
+  async _getRemoteCpuMac() {
+    try {
+      const j = await this._macmonSample();
+      return {
+        usage: Math.round((Number(j.cpu_usage_pct) || 0) * 100),
+        temperature: Math.round((Number(j.temp?.cpu_temp_avg) || 0) * 10) / 10,
+        temperatureLabel: "CPU avg",
+        temperatureSource: "macmon",
+        draw: Math.round((Number(j.cpu_power) || 0) * 10) / 10,
+        tdp: 0,
+      };
+    } catch (err) {
+      this._logMacmonError("CPU", err);
+      return this._defaultCpu();
+    }
+  }
+
+  async _macmonRam() {
+    try {
+      const m = (await this._macmonSample()).memory || {};
+      const total = Math.round((Number(m.ram_total) || 0) / 1048576);
+      const used = Math.round((Number(m.ram_usage) || 0) / 1048576);
+      if (!(total > 0)) return null;
+      return { used, total, percentage: Math.round((used / total) * 100) };
+    } catch {
+      return null;
+    }
+  }
+
+  async _getRemoteUnifiedMemoryMac() {
+    const ram = await this._macmonRam();
+    if (!ram) return this._defaultUnifiedMemory();
+    return {
+      total: ram.total,
+      gpuUsed: 0,
+      cpuUsed: ram.used,
+      used: ram.used,
+      available: Math.max(0, ram.total - ram.used),
+      percentage: ram.percentage,
+      oomRisk: ram.percentage > 85 ? "high" : ram.percentage > 60 ? "medium" : "low",
+      bandwidth: { current: 0, peak: 0 },
+    };
   }
 
   /** macOS RAM via sysctl + memory_pressure (one SSH round trip). */

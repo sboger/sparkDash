@@ -2,6 +2,8 @@ import { BenchIcon } from "./components/bench/BenchIcon";
 import { setConfiguredTimeZone } from "./shared/timeZone";
 import { useState, useCallback, useEffect, useMemo } from "react";
 import { useSnapshot } from "./hooks/useSnapshot";
+import { useFleetAlerts } from "./hooks/useFleetAlerts";
+import { useBrowserAlerts } from "./hooks/useBrowserAlerts";
 import { useAppRoute, useRoute } from "./hooks/useRoute";
 import { useSmoothWheel } from "./hooks/useSmoothWheel";
 import { fetchSparks, reorderSparks, fetchSettings, fetchHealth } from "./api/client";
@@ -32,6 +34,7 @@ import {
   ListIcon,
   PanelLeftIcon,
   TokensIcon,
+  ThermometerIcon,
 } from "./components/ui/icons";
 import { ConnectionBanner } from "./components/ui/ConnectionBanner";
 import { ErrorBanner } from "./components/ui/ErrorBanner";
@@ -40,18 +43,24 @@ import {
   SHOWCASE_ID,
   ENERGY_ID,
   OVERVIEW_ID,
+  TEMPS_ID,
   TOKENS_ID,
   benchId,
   benchTypeOf,
+  toolId,
+  toolTypeOf,
   idToPath,
   isPageId,
   isStaleSparkId,
 } from "./constants";
 import { TokensPage } from "./components/TokensPage/TokensPage";
 import { EnergyPage } from "./components/EnergyPage/EnergyPage";
+import { TempsPage } from "./components/TempsPage/TempsPage";
 import { ActivityPage } from "./components/ActivityPage/ActivityPage";
 import { BenchPage } from "./components/bench/BenchPage";
 import { BENCH_SPARK_KEY, BENCH_TYPES } from "./components/bench/benchCatalog";
+import { ToolsPage } from "./components/tools/ToolsPage";
+import { toolPaletteCommands } from "./components/tools/toolsPalette";
 import type { AuthMode, Settings, SparkSnapshot } from "./api/types";
 import { AccessTokenPrompt } from "./components/AccessTokenDialog";
 import { onTokenChange } from "./api/authToken";
@@ -172,6 +181,7 @@ function DashboardApp() {
     lastValidSnapshotAt,
     snapshotError,
     refreshInterval,
+    serverAlerts,
   } = useSnapshot();
   const sparks = snapSparks;
   const activeSpark = liveActive;
@@ -235,6 +245,16 @@ function DashboardApp() {
     return ordered;
   }, [liveSparks, orderOverride]);
 
+  // Tab badge + desktop notifications (both opt-in, per browser): the strip's own
+  // list, every alert whatever the strip shows. Live snapshots only — placeholders from the REST fallback are all "offline".
+  const fleetAlerts = useFleetAlerts({
+    sparks,
+    alertsEnabled: settings?.alertsEnabled ?? false,
+    serverAlerts,
+    temperatureUnit: settings?.temperatureUnit ?? "celsius",
+  });
+  useBrowserAlerts(fleetAlerts.rows, fleetAlerts.ready && settings != null, fleetAlerts.source);
+
   // Drop override once server/WS order matches
   useEffect(() => {
     if (!orderOverride) return;
@@ -246,6 +266,7 @@ function DashboardApp() {
   const isOverview = activeId === OVERVIEW_ID;
   const onPage = isPageId(activeId);
   const benchType = benchTypeOf(activeId);
+  const toolType = toolTypeOf(activeId);
   const hideWorkers = settings?.hideWorkers ?? false;
   // Charts read the time zone from a module value; set it before the pages render, and
   // re-key <main> below so a change in Settings redraws them.
@@ -440,8 +461,9 @@ function DashboardApp() {
     cmds.push(
       { id: "nav:tokens", group: "Go to", label: "Token totals", hint: "Page", icon: <TokensIcon className="h-4 w-4" />, keywords: "llm tokens generated prompt cached usage", run: () => navigate(TOKENS_ID) },
       { id: "nav:energy", group: "Go to", label: "Fleet energy", hint: "Page", icon: <BoltIcon className="h-4 w-4" />, keywords: "power kwh watts cost electricity", run: () => navigate(ENERGY_ID) },
+      { id: "nav:temps", group: "Go to", label: "Temps", hint: "Page", icon: <ThermometerIcon className="h-4 w-4" />, keywords: "gpu temperature thermal temps heat cooling", run: () => navigate(TEMPS_ID) },
       { id: "nav:showcase", group: "Go to", label: "Showcase", hint: "Page", icon: <TerminalIcon className="h-4 w-4" />, keywords: "prompts terminals stream demo", run: () => navigate(SHOWCASE_ID) },
-      { id: "nav:activity", group: "Go to", label: "Activity", hint: "Page", icon: <ListIcon className="h-4 w-4" />, keywords: "events log history recent", run: () => navigate(ACTIVITY_ID) }
+      { id: "nav:activity", group: "Go to", label: "Activity", hint: "Page", icon: <ListIcon className="h-4 w-4" />, keywords: "events log history recent", run: () => navigate(ACTIVITY_ID) },
     );
     for (const s of displaySparks) {
       cmds.push({
@@ -454,6 +476,7 @@ function DashboardApp() {
         run: () => navigate(s.id),
       });
     }
+    cmds.push(...toolPaletteCommands(navigate));
     for (const b of BENCH_TYPES) {
       cmds.push({
         id: `bench:${b.id}`,
@@ -495,6 +518,8 @@ function DashboardApp() {
           onOpenSearch={() => setShowPalette(true)}
           benchType={benchType}
           onSelectBench={(type) => navigate(benchId(type))}
+          toolType={toolType}
+          onSelectTool={(type) => navigate(toolId(type))}
           connected={connected}
           refreshInterval={refreshInterval}
           authMode={authMode}
@@ -543,10 +568,14 @@ function DashboardApp() {
                 <TokensPage sparks={displaySparks} onSelectSpark={navigate} />
               ) : activeId === ENERGY_ID ? (
                 <EnergyPage sparks={displaySparks} settings={settings} onSelectSpark={navigate} />
+              ) : activeId === TEMPS_ID ? (
+                <TempsPage sparks={displaySparks} onSelectSpark={navigate} />
               ) : activeId === ACTIVITY_ID ? (
                 <ActivityPage sparks={displaySparks} onSelectSpark={navigate} />
               ) : activeId === SHOWCASE_ID ? (
                 <ShowcaseView sparks={displaySparks} />
+              ) : toolType ? (
+                <ToolsPage type={toolType} sparks={displaySparks} />
               ) : benchType ? (
                 <BenchPage type={benchType} sparks={displaySparks} benchShareImage={settings?.benchShareImage ?? false} />
               ) : isOverview ? (
@@ -557,6 +586,8 @@ function DashboardApp() {
                   showFleetEnergy={settings?.showFleetEnergy ?? true}
                   showInferenceActivity={settings?.inferenceActivityEnabled === true}
                   showFleetExceptions={settings?.showFleetExceptions ?? false}
+                  alertsEnabled={settings?.alertsEnabled ?? false}
+                  serverAlerts={serverAlerts}
                   showOverviewSearch={settings?.showOverviewSearch ?? false}
                   showLlmTokenTotals={settings?.showLlmTokenTotals ?? true}
                   showActivityFeed={settings?.showActivityFeed ?? true}
@@ -578,7 +609,9 @@ function DashboardApp() {
                   showVramBreakdown={settings?.showVramBreakdown ?? true}
                   temperatureUnit={settings?.temperatureUnit ?? "celsius"}
                   benchShareImage={settings?.benchShareImage ?? false}
+                  metricsHistory={settings?.metricsHistory ?? false}
                   onEdit={() => setEditId(displayActive.id)}
+                  onNavigate={navigate}
                 />
               ) : !fleetLoaded || staleSpark ? null : (
                 <div className="panel mx-auto mt-16 max-w-md p-8 text-center">

@@ -11,6 +11,10 @@ import { TailscaleProbe } from "../collectors/TailscaleProbe.js";
 import { llmDaily } from "../collectors/LlmDaily.js";
 import { HealthEvaluator } from "../health/HealthEvaluator.js";
 import { sshExec } from "../collectors/ssh.js";
+
+/** macOS uptime in seconds from `kern.boottime` (`{ sec = 1791857261, usec = ... } ...`). */
+export const DARWIN_UPTIME_CMD =
+  "b=$(sysctl -n kern.boottime | sed -E 's/^[{] sec = ([0-9]+),.*/\\1/'); echo $(( $(date +%s) - b ))";
 import {
   POLL_INTERVAL_STORAGE,
   POLL_INTERVAL_LIVENESS,
@@ -721,6 +725,9 @@ export class SparkMonitor {
     if (this.spark.isLocal) {
       const mapped = path.join(HOST_PATHS.PROC, "uptime");
       content = fs.readFileSync(mapped, "utf8");
+    } else if (this.spark.platform === "darwin") {
+      // macOS has no /proc/uptime; without this every Mac unit stays offline.
+      content = await sshExec(this.spark, DARWIN_UPTIME_CMD);
     } else {
       content = await sshExec(this.spark, "cat /proc/uptime");
     }
@@ -850,6 +857,28 @@ export class SparkMonitor {
     if (this.spark.storagePollDisabled) delete out.storage;
     if (!this._llmMonitoringEnabled()) delete out.llm;
     return out;
+  }
+
+  /** Epoch ms of the last poll of `domain` that returned real data, or null (never, or not polled). */
+  lastCollectedAt(domain) {
+    const at = this._lastSuccess[domain];
+    return Number.isFinite(at) ? at : null;
+  }
+
+  /**
+   * Whether the latest completed poll of `domain` returned real data. A failed GPU/CPU read is
+   * zero-filled and every other domain keeps its previous value, so "the poll ran" is not enough.
+   */
+  collectionOk(domain) {
+    if (domain === "gpu" || domain === "cpu") return this._metricCollectionSuccessful[domain] === true;
+    const at = this._lastSuccess[domain];
+    return Number.isFinite(at) && at === this._lastUpdate[domain];
+  }
+
+  /** Current cadence (ms) of a collector that follows Settings → Poll interval, or null for other domains. */
+  pollIntervalMs(domain) {
+    const ms = this._fastIntervals[domain];
+    return Number.isFinite(ms) && ms > 0 ? ms : null;
   }
 
   _noteThrottle(gpu) {
