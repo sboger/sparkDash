@@ -224,7 +224,11 @@ export class SparkMonitor {
     this._hardwareSummary = this._staticHardwareSummary(spark);
     this._stopped = false;
     if (spark?.kind === "host") {
-      void (spark.platform === "windows" ? this.collector.detectWindowsHardware() : this.collector.detectHardware())
+      void (spark.platform === "windows"
+        ? this.collector.detectWindowsHardware()
+        : spark.platform === "darwin"
+          ? this.collector.detectMacHardware()
+          : this.collector.detectHardware())
         .then((detected) => {
           if (this._stopped || !detected) return;
           this._hardwareSummary = { ...this._hardwareSummary, ...detected };
@@ -1333,8 +1337,10 @@ export class SparkMonitor {
    */
   _staticHardwareSummary(spark) {
     if (spark?.kind === "host") {
+      const device =
+        spark.platform === "windows" ? "Windows GPU host" : spark.platform === "darwin" ? "Mac (Apple Silicon)" : "Linux GPU host";
       return {
-        device: spark.platform === "windows" ? "Windows GPU host" : "Linux GPU host",
+        device,
         cpuModel: null,
         cpuCores: null,
         totalMemoryGB: null,
