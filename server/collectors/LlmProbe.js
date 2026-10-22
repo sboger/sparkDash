@@ -117,7 +117,7 @@ export class LlmProbe {
     this._openTunnel = openSshLlmTunnel;
 
     // State
-    this.backendType = null; // 'vllm' | 'llama.cpp' | 'sglang' | 'lmstudio' | 'ollama' | 'ds4' | 'exl3' | 'q27' | 'tensorfold' | 'freetoken' | 'radiance' | 'strata' | 'flare' | null
+    this.backendType = null; // 'vllm' | 'llama.cpp' | 'sglang' | 'lmstudio' | 'ollama' | 'ds4' | 'exl3' | 'q27' | 'tensorfold' | 'freetoken' | 'radiance' | 'strata' | 'flare' | 'locals' | 'splash' | 'mlxvlm' | null
     this.serverIsOpenAI = null; // true = OpenAI-compatible
     /** Whether /v1/models (or /slots) answered without credentials. null = unknown. */
     this.authOpen = null;
@@ -633,7 +633,7 @@ export class LlmProbe {
    * @param {unknown} ownedBy
    * @param {boolean} [flareCard] `/v1/models` carried Flare's `flare` object (its
    *   `owned_by` is the generic "local", so the card shape is the signal)
-   * @returns {Promise<"lmstudio" | "ollama" | "ds4" | "sglang" | "exl3" | "q27" | "tensorfold" | "freetoken" | "radiance" | "flare" | "vllm">}
+   * @returns {Promise<"lmstudio" | "ollama" | "ds4" | "sglang" | "exl3" | "q27" | "tensorfold" | "freetoken" | "mlxvlm" | "radiance" | "flare" | "vllm">}
    */
   async _classifyOpenAIBackend(ownedBy, flareCard = false) {
     // An owned_by that is exactly an engine's own name is classified from the card alone: detection
@@ -673,6 +673,7 @@ export class LlmProbe {
     if (await this._probeIsExl3()) return "exl3";
     if (await this._probeIsQ27()) return "q27";
     if (await this._probeIsFlare()) return "flare";
+    if (await this._probeIsMlxVlm()) return "mlxvlm";
     if (await this._probeIsFreeToken()) return "freetoken";
     return "vllm";
   }
@@ -860,6 +861,23 @@ export class LlmProbe {
     }
   }
 
+  /**
+   * True when JSON /metrics matches mlx_vlm's server contract (`python -m
+   * mlx_vlm server`): a `summary` block with cumulative token totals plus the
+   * live `server` block. Specific enough that catch-all JSON servers (LM Studio)
+   * answering 200 on every path cannot misfire it.
+   */
+  async _probeIsMlxVlm() {
+    try {
+      const res = await this._fetch(`${this.baseUrl}/metrics`);
+      if (!res.ok) return false;
+      const data = await res.json().catch(() => null);
+      return LlmProbe._metricsLookLikeMlxVlm(data);
+    } catch {
+      return false;
+    }
+  }
+
   /** @param {string} body */
   static _metricsLookLikeFlare(body) {
     return /(?:^|\n)flare_generated_tokens_total(?:\{|\s)/m.test(String(body || ""));
@@ -869,6 +887,19 @@ export class LlmProbe {
   static _metricsLookLikeSplash(body) {
     return /(?:^|\n)splash_(?:decode_output_tokens_total|requests_submitted_total)(?:\{|\s)/m.test(
       String(body || "")
+    );
+  }
+
+  /** @param {unknown} data */
+  static _metricsLookLikeMlxVlm(data) {
+    if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+    const summary = data.summary;
+    const server = data.server;
+    if (!summary || typeof summary !== "object" || !server || typeof server !== "object") return false;
+    return (
+      Number.isFinite(Number(summary.completion_tokens_total)) &&
+      Number.isFinite(Number(summary.prompt_tokens_total)) &&
+      Number.isFinite(Number(server.loaded_context_size))
     );
   }
 
@@ -1019,6 +1050,13 @@ export class LlmProbe {
       } catch {
         this._clearFlareRates();
       }
+      return this._getSnapshot();
+    }
+
+    // mlx_vlm (`python -m mlx_vlm server`, Apple Silicon): JSON /metrics with a
+    // cumulative summary block and the live engine state.
+    if (this.backendType === "mlxvlm") {
+      await this._applyMlxVlmMetrics(dtSec);
       return this._getSnapshot();
     }
 
@@ -1987,6 +2025,76 @@ export class LlmProbe {
     if (Number.isFinite(conns) && conns >= 0 && this.requestsRunning == null) {
       this.requestsRunning = Math.round(conns);
       this.slotsActive = Math.round(conns);
+    }
+  }
+
+  /**
+   * Apply mlx_vlm's JSON /metrics. `summary.completion_tokens_total` and
+   * `prompt_tokens_total` are cumulative over finished requests, so live tok/s
+   * comes from the poll delta (the `dtSec < 10` guard seeds the first poll);
+   * while a request is in flight its tokens are not counted yet, so the last
+   * finished request's `latest.decode_tok_s` keeps the tile live and it expires
+   * when the queue drains. `summary.avg_decode_tok_s` is a lifetime average and
+   * is never reported as a live rate.
+   * @param {number} dtSec
+   */
+  async _applyMlxVlmMetrics(dtSec) {
+    let data;
+    try {
+      const res = await this._fetch(`${this.baseUrl}/metrics`);
+      if (!res.ok) return;
+      data = await res.json().catch(() => null);
+    } catch {
+      return;
+    }
+    if (!LlmProbe._metricsLookLikeMlxVlm(data)) return;
+    const summary = data.summary ?? {};
+    const server = data.server ?? {};
+
+    // mlx_vlm reports the model's full context window here; the KV cap
+    // (--max-kv-size) does not change it.
+    const ctx = Number(server.loaded_context_size);
+    if (Number.isFinite(ctx) && ctx > 0) this.contextLength = Math.round(ctx);
+
+    const gen = Number(summary.completion_tokens_total);
+    const prompt = Number(summary.prompt_tokens_total);
+    const inFlight = Number(summary.in_flight);
+    const busy = Number.isFinite(inFlight) && inFlight > 0;
+
+    if (Number.isFinite(gen) && gen >= 0 && Number.isFinite(prompt) && prompt >= 0) {
+      if (dtSec > 0 && dtSec < 10) {
+        const deltaOut = gen - this.lastTokenCounts.output;
+        const deltaIn = prompt - this.lastTokenCounts.input;
+        this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
+        this.prefillTps = Math.max(0, Math.round((deltaIn / dtSec) * 100) / 100);
+      } else if (!busy) {
+        this.generationTps = 0;
+        this.prefillTps = 0;
+      }
+      this.lastTokenCounts.input = prompt;
+      this.lastTokenCounts.output = gen;
+      this.totalPromptTokens = prompt;
+      this.totalOutputTokens = gen;
+    }
+
+    const running = Number.isFinite(inFlight) && inFlight >= 0 ? Math.round(inFlight) : null;
+    this.requestsRunning = running;
+    if (running != null) this.slotsActive = running;
+    // The engine is generating even while the counter delta is still 0.
+    this.decodeActive = busy;
+    const queued = Number(server.request_queue_depth);
+    if (Number.isFinite(queued) && queued >= 0) this.requestsWaiting = Math.round(queued);
+
+    // A long in-flight generation has no counter delta yet; its expected rate is
+    // the last finished request's measured decode rate (SGLang-style sticky).
+    const latest = data.latest ?? {};
+    const latestDecode = Number(latest.decode_tok_s);
+    if (busy && Number.isFinite(latestDecode) && latestDecode > 0 && !(this.generationTps > 0)) {
+      this.generationTps = Math.round(latestDecode * 100) / 100;
+    }
+    const latestPrefill = Number(latest.prefill_tok_s);
+    if (busy && Number.isFinite(latestPrefill) && latestPrefill > 0 && !(this.prefillTps > 0)) {
+      this.prefillTps = Math.round(latestPrefill * 100) / 100;
     }
   }
 
