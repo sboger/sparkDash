@@ -45,13 +45,15 @@ function nvidiaView(gpu) {
 
 export class HealthEvaluator {
   /**
-   * @param {{ now?: () => number, thresholds?: () => { warnC: number, criticalC: number } }} [opts]
+   * @param {{ now?: () => number, thresholds?: () => { warnC: number, criticalC: number }, lowPowerEnabled?: boolean }} [opts]
    *   `thresholds` is read on every evaluation, so a settings change applies
    *   on the next sample without rebuilding the evaluator.
    */
-  constructor({ now = Date.now, thresholds = () => DEFAULT_TEMP_THRESHOLDS } = {}) {
+  constructor({ now = Date.now, thresholds = () => DEFAULT_TEMP_THRESHOLDS, lowPowerEnabled = true } = {}) {
     this._now = now;
     this._thresholds = thresholds;
+    /** Apple Silicon GPUs draw ~0.003-5 W while decoding (memory-bound), so the low-power rule is off for darwin units. */
+    this._lowPowerEnabled = lowPowerEnabled;
     this._lowPowerStreak = 0;
     this._kernel = { xid: null, oom: null };
     this._kernelAt = { xid: 0, oom: 0 };
@@ -102,6 +104,10 @@ export class HealthEvaluator {
   }
 
   _lowPower(gpu, domain, out) {
+    if (!this._lowPowerEnabled) {
+      if (domain === "gpu") this._lowPowerStreak = 0;
+      return;
+    }
     const util = num(gpu?.usage);
     const draw = num(gpu?.power?.draw);
     if (util == null || draw == null) {

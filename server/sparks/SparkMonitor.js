@@ -136,6 +136,9 @@ export class SparkMonitor {
         const { healthTempWarnC, healthTempCriticalC } = getSettings();
         return { warnC: healthTempWarnC, criticalC: healthTempCriticalC };
       },
+      // Apple Silicon decoding is memory-bound (high utilisation on a few watts),
+      // so the NVIDIA-shaped low-power rule is off for darwin units.
+      lowPowerEnabled: spark?.platform !== "darwin",
     });
     this._health = [];
     this._prevHealthIds = null;

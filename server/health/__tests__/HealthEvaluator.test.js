@@ -35,6 +35,16 @@ test("low power needs a streak of consecutive gpu samples and resets", () => {
   assert.deepEqual(h.evaluate(m, "other"), []);
 });
 
+test("the low-power rule can be switched off for Apple Silicon units", () => {
+  // A decoding Apple GPU sits at high utilisation on a few watts; that shape is
+  // normal, so darwin units construct the evaluator with lowPowerEnabled: false.
+  const off = new HealthEvaluator({ lowPowerEnabled: false });
+  const m = { gpu: { usage: 97, power: { draw: 2.5 } } };
+  for (let i = 0; i < LOW_POWER_STREAK + 2; i++) assert.deepEqual(off.evaluate(m, "gpu"), []);
+  // Everything else still reports.
+  assert.deepEqual(ids(off.evaluate({ gpu: { temperature: 95, usage: 97, power: { draw: 2.5 } } }, "gpu")), ["thermal"]);
+});
+
 const nv = (temperature, usage, draw) => ({ vendor: "nvidia", temperature, usage, power: { draw, limit: 200 } });
 const intelCard = (temperature, usage, draw) => ({ vendor: "intel", temperature, usage, power: { draw, limit: 200 } });
 const hostOf = (gpus) => ({
