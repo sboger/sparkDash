@@ -77,10 +77,43 @@ test("macOS without macmon degrades to defaults; RAM falls back to sysctl", asyn
   assert.equal((await c.collectCpu()).usage, 0);
 });
 
-test("macOS network collector is skipped instead of failing on /sys/class/net", async () => {
+// Captured from `route -n get default` + `netstat -ibn` on an M6 Mac mini.
+const NET_OUT = `__ROUTE__
+interface: en0
+      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>
+__NETSTAT__
+Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll
+lo0        16384 <Link#1>                        716519     0 1510598482   716519     0 1510598482     0
+lo0        16384 127           127.0.0.1         716519     - 1510598482   716519     - 1510598482     -
+gif0*      1280  <Link#2>                             0     0          0        0     0          0     0
+anpi0      1500  <Link#4>    ea:f8:ac:b3:96:c6        0     0          0        0     0          0     0
+en0        1500  <Link#7>    c8:80:6d:41:df:a7  8210327     0 1575950587 13967509     0 10082357663     0
+en0        1500  fe80::14a3: fe80:7::14a3:17c3  8210327     - 1575950587 13967509     - 10082357663     -
+en0        1500  192.168.1     192.168.1.223    8210327     - 1575950587 13967509     - 10082357663     -
+bridge0    1500  <Link#14>   36:d8:f5:89:50:00        0     0          0        0     0          0     0
+nan0*      1500  <Link#15>   fe:00:00:00:00:01        0     0          0        0     0          0     0`;
+
+test("macOS network comes from netstat counters and the default route", async () => {
+  const { parseMacNetwork, MAC_NETWORK_CMD } = await import("../macMetrics.js");
+  const parsed = parseMacNetwork(NET_OUT);
+  assert.equal(parsed.primaryInterface, "en0");
+  assert.deepEqual(parsed.interfaces.map((i) => i.name), ["en0"], "virtual, loopback and NAN interfaces are skipped");
+  assert.equal(parsed.interfaces[0].rxBytes, 1575950587);
+  assert.equal(parsed.interfaces[0].txBytes, 10082357663);
+  assert.equal(parsed.interfaces[0].ip, "192.168.1.223");
+  execFileSync("sh", ["-n", "-c", MAC_NETWORK_CMD]);
+
+  // Speeds are deltas against the previous poll.
   const c = mac();
-  c._getRemoteNetwork = async () => { throw new Error("Linux collector must not run on darwin"); };
-  assert.deepEqual(await c.collectNetwork(), c._defaultNetwork());
+  c.lastNetworkStats.set("en0", { rxBytes: 1575950587 - 2048, txBytes: 10082357663 - 4096, time: Date.now() - 1000 });
+  const net = await c._getRemoteNetworkMac(async () => NET_OUT);
+  assert.equal(net.primaryInterface, "en0");
+  assert.equal(net.interfaces.length, 1);
+  assert.equal(net.interfaces[0].ip, "192.168.1.223");
+  assert.equal(net.interfaces[0].operstate, "up");
+  assert.ok(net.interfaces[0].rxSpeed > 0 && net.interfaces[0].rxSpeed <= 2100, `rx speed ${net.interfaces[0].rxSpeed}`);
+  assert.ok(net.interfaces[0].txSpeed > 0 && net.interfaces[0].txSpeed <= 4200, `tx speed ${net.interfaces[0].txSpeed}`);
+  assert.equal(net.linkSpeedMbps, null, "BSD netstat publishes no link speed");
 });
 
 test("MACMON_CMD and DARWIN_UPTIME_CMD are valid POSIX sh", () => {

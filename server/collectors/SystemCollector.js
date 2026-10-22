@@ -14,6 +14,7 @@ import {
   splitWindowsGpuOutput,
   windowsGpuAsLinuxOutput,
 } from "./windowsMetrics.js";
+import { MAC_NETWORK_CMD, parseMacNetwork } from "./macMetrics.js";
 
 const NVERR_JOURNAL_CMD =
   'journalctl -k --no-pager -q --grep=NV_ERR_NO_MEMORY 2>/dev/null | grep -c NV_ERR_NO_MEMORY || true';
@@ -533,7 +534,7 @@ export class SystemCollector {
 
   /** Collect network metrics (interfaces, speeds). */
   async collectNetwork() {
-    if (!this.spark.isLocal && this.isMac) return this._defaultNetwork();
+    if (!this.spark.isLocal && this.isMac) return this._getRemoteNetworkMac();
     if (!this.spark.isLocal) return this.isWindows ? this._getWindowsNetwork() : this._getRemoteNetwork();
     try {
       const interfaces = this._tagDisabledInterfaces(await this._getNetworkMetrics());
@@ -2516,6 +2517,40 @@ export class SystemCollector {
     } catch (err) {
       console.error(`[SystemCollector] macOS model inventory error for ${this.spark.id}:`, err.message);
       return null;
+    }
+  }
+
+  /** macOS network: netstat -ibn counters + the default route (BSD has no /proc/net/dev). */
+  async _getRemoteNetworkMac(executor = sshExec) {
+    try {
+      const parsed = parseMacNetwork(await executor(this.spark, MAC_NETWORK_CMD));
+      const now = Date.now();
+      const interfaces = parsed.interfaces.map((i) => {
+        const last = this.lastNetworkStats.get(i.name) || { rxBytes: i.rxBytes, txBytes: i.txBytes, time: now };
+        const dtSec = (now - last.time) / 1000;
+        const rxSpeed = dtSec > 0 ? (i.rxBytes - last.rxBytes) / dtSec : 0;
+        const txSpeed = dtSec > 0 ? (i.txBytes - last.txBytes) / dtSec : 0;
+        this.lastNetworkStats.set(i.name, { rxBytes: i.rxBytes, txBytes: i.txBytes, time: now });
+        return {
+          name: i.name,
+          rxSpeed: Math.max(0, Math.round(rxSpeed)),
+          txSpeed: Math.max(0, Math.round(txSpeed)),
+          ip: i.ip,
+          operstate: i.operstate,
+          disabled: false,
+        };
+      });
+      const tagged = this._tagDisabledInterfaces(interfaces);
+      let primaryInterface = parsed.primaryInterface;
+      if (primaryInterface && (this.spark.disabledInterfaces || []).includes(primaryInterface)) {
+        const alt = tagged.find((i) => !i.disabled);
+        primaryInterface = alt?.name ?? primaryInterface;
+      }
+      // BSD netstat has no link speed; the UI keeps its last value.
+      return { primaryInterface, linkSpeedMbps: null, interfaces: tagged, wolMac: null };
+    } catch (err) {
+      console.error(`[SystemCollector] Remote macOS Network error for ${this.spark.id}:`, err.message);
+      return this._defaultNetwork();
     }
   }
 
