@@ -9,7 +9,7 @@ import {
   updateSpark,
 } from "../api/client";
 import type { SparkConfig, SparkRole, SparkTestResponse } from "../api/types";
-import { deviceKindNoun, editDeviceTitle, UNIT_TYPE_OPTIONS, unitTypeOf, unitTypePatch, type UnitType } from "../shared/deviceKind";
+import { deviceKindNoun, editDeviceTitle, UNIT_TYPE_OPTIONS, unitTypeOf, unitTypePatch, isSshOnlyPlatform, type UnitType } from "../shared/deviceKind";
 import { resolveSparkRole } from "../api/sparkRole";
 import { useModalPresence } from "../hooks/useModalPresence";
 import { useOverlayClose } from "../hooks/useOverlayClose";
@@ -397,7 +397,7 @@ export function EditSparkDialog({
               </div>
               )}
 
-              {config.platform !== "windows" && (
+              {!isSshOnlyPlatform(config.platform) && (
                 <label className="check-row">
                   <input
                     type="checkbox"
