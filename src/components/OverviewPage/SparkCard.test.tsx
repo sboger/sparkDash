@@ -37,6 +37,34 @@ describe("SparkCard", () => {
     );
   });
 
+  it("keeps the CPU power bar steady on a Mac whose idle CPU draw rounds to 0 W", () => {
+    const mac = (draw: number) => {
+      const s = makeSpark("m");
+      return {
+        ...s,
+        kind: "host",
+        platform: "darwin",
+        hardware: { ...s.hardware, device: "Mac (Apple Silicon)", cpuCores: 8 },
+        metrics: {
+          ...s.metrics,
+          gpu: { usage: 1, temperature: 30, vram: { used: 1, total: 1, available: 0, percentage: 100 }, power: { draw: 0.03, limit: 25 }, metricAvailability: { powerDraw: true, powerLimit: false } },
+          cpu: { usage: 0, temperature: 30, draw, tdp: 0 },
+          ram: { used: 2048, total: 8192, available: 6144, percentage: 25 },
+        },
+      } as unknown as SparkSnapshot;
+    };
+    for (const draw of [0, 0.1, 2.4]) {
+      const { container } = render(<SparkCard spark={mac(draw)} temperatureUnit="celsius" />);
+      expect(container.textContent).toContain("CPU power");
+      expect(container.textContent).toContain(`${draw} W`);
+    }
+    // A Linux host with no CPU power sensor still hides the bar.
+    const linux = makeSpark("l");
+    Object.assign(linux.metrics, { cpu: { usage: 25, temperature: 45, draw: 0, tdp: 0 } });
+    const { container } = render(<SparkCard spark={linux} temperatureUnit="celsius" />);
+    expect(container.textContent).not.toContain("CPU power");
+  });
+
   it("renders unknown slot occupancy without presenting it as zero", () => {
     const spark = makeSpark("fixture");
     Object.assign(spark.metrics.llm[0], {

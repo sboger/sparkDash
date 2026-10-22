@@ -115,10 +115,41 @@ function SparkCardImpl({
   const cpuTempRaw = cpuMetrics && Number.isFinite(cpuMetrics.temperature) && cpuMetrics.temperature > 0 ? cpuMetrics.temperature : null;
   const cpuTempVal = cpuTempRaw === null ? 0 : temperatureUnit === "fahrenheit" ? toF(cpuTempRaw) : cpuTempRaw;
   const cpuTempColor = cpuTempRaw !== null && cpuTempRaw > 80 ? "var(--color-danger)" : cpuTempRaw !== null && cpuTempRaw >= 75 ? "var(--color-warning)" : "var(--color-success)";
-  const cpuPower = cpuMetrics && (cpuMetrics.draw > 0 || cpuMetrics.tdp > 0) ? { draw: cpuMetrics.draw, tdp: cpuMetrics.tdp } : null;
-  const cpuPowerPct = cpuPower && cpuPower.tdp > 0 ? (cpuPower.draw / cpuPower.tdp) * 100 : 0;
+  // A host with no CPU power sensor hides the bar; a darwin unit always reports one
+  // (macmon's cpu_power, 0 W when idle), so keep the bar in place instead of letting
+  // it pop in and out as the idle counter rounds between 0 and 0.1 W.
+  const cpuPowerReported = !!cpuMetrics && (cpuMetrics.draw > 0 || cpuMetrics.tdp > 0);
+  const cpuPower =
+    cpuMetrics && (cpuPowerReported || spark.platform === "darwin")
+      ? { draw: cpuMetrics.draw, tdp: cpuMetrics.tdp }
+      : null;
+  // Apple Silicon publishes no CPU power limit, and macmon's counter rounds to 0 at
+  // idle, so the bar used to pop in and out on every poll. Keep it in place for
+  // darwin and scale it against a nominal envelope of ~3 W per core (measured: an M6
+  // draws 23.6 W across 8 cores at full load); the caption stays the real draw.
+  const CPU_NOMINAL_W_PER_CORE = 3;
+  const cpuNominalW = Math.max(
+    10,
+    Math.round(((spark.hardware.cpuCores ?? 8) * CPU_NOMINAL_W_PER_CORE) / 5) * 5,
+  );
+  const cpuPowerPct = cpuPower
+    ? cpuPower.tdp > 0
+      ? (cpuPower.draw / cpuPower.tdp) * 100
+      : spark.platform === "darwin"
+        ? Math.min(100, (cpuPower.draw / cpuNominalW) * 100)
+        : 0
+    : 0;
   const power = gpu?.power;
-  const powerPct = power && power.limit > 0 ? (power.draw / power.limit) * 100 : 0;
+  // macOS publishes no package power limit (macmon has no TDP), so the bar
+  // scales against a nominal envelope instead of sitting empty; the caption
+  // still shows the real draw with "—" for the limit.
+  const POWER_NOMINAL_W = 100;
+  const powerPct =
+    power && power.limit > 0
+      ? (power.draw / power.limit) * 100
+      : gpu?.metricAvailability?.powerDraw !== false && power
+        ? Math.min(100, (power.draw / POWER_NOMINAL_W) * 100)
+        : 0;
 
   const rootDisk =
     spark.metrics.storage.find((d) => d.label === "/") ?? spark.metrics.storage.find((d) => d.device === "nvme0n1p2");
@@ -277,21 +308,22 @@ function SparkCardImpl({
         <>
           <div className="ov-sc__body">
             <div className="ov-sc__stats">
-              {breakdown ? (
-                <VramBreakdownBar
-                  label={breakdown.systemMB != null ? "Unified memory" : "VRAM"}
-                  breakdown={breakdown}
-                  showLegend
-                />
-              ) : (
-                <Bar
-                  label={gpu.vram?.total ? "VRAM" : "Unified memory"}
-                  caption={vramAvailable && memTotal > 0 ? `${fmtStorage(memUsed, false)} / ${fmtStorage(memTotal, true)}` : "—"}
-                  pct={vramAvailable ? memPct : 0}
-                  color={memColor}
-                  sub={memTotal > 0 && memAvail > 0 ? { label: "Available", value: formatMb(memAvail) } : null}
-                />
-              )}
+              {spark.platform !== "darwin" &&
+                (breakdown ? (
+                  <VramBreakdownBar
+                    label={breakdown.systemMB != null ? "Unified memory" : "VRAM"}
+                    breakdown={breakdown}
+                    showLegend
+                  />
+                ) : (
+                  <Bar
+                    label={gpu.vram?.total ? "VRAM" : "Unified memory"}
+                    caption={vramAvailable && memTotal > 0 ? `${fmtStorage(memUsed, false)} / ${fmtStorage(memTotal, true)}` : "—"}
+                    pct={vramAvailable ? memPct : 0}
+                    color={memColor}
+                    sub={memTotal > 0 && memAvail > 0 ? { label: "Available", value: formatMb(memAvail) } : null}
+                  />
+                ))}
               <Bar label="GPU" caption={gpu.metricAvailability?.usage === false ? "—" : `${Math.round(usage)}%`} pct={gpu.metricAvailability?.usage === false ? 0 : usage} color={ringColor} />
               {spark.kind === "host" && spark.metrics.ram?.total ? (
                 <Bar
@@ -317,7 +349,16 @@ function SparkCardImpl({
                   color={cpuTempColor}
                 />
               ) : null}
-              {cpuPower ? <Bar label="CPU power" caption={`${cpuPower.draw} / ${cpuPower.tdp} W`} pct={cpuPowerPct} color="var(--color-violet)" /> : null}
+              {cpuPower ? (
+                <Bar
+                  label="CPU power"
+                  // No published TDP on Apple Silicon or most Jetsons: show the draw
+                  // alone rather than "0.1 / 0 W" or a limit that does not exist.
+                  caption={cpuPower.tdp > 0 ? `${cpuPower.draw} / ${cpuPower.tdp} W` : `${cpuPower.draw} W`}
+                  pct={cpuPowerPct}
+                  color="var(--color-violet)"
+                />
+              ) : null}
             </div>
           </div>
           {showLauncher ? <ModelLauncher spark={spark} onOpen={onSelect} busy={loadingHint} /> : null}
