@@ -130,7 +130,7 @@ export class SparkMonitor {
     /** @type {boolean | null} null until the first successful GPU sample. */
     this._prevThermal = null;
     /** Health rules + their sample-streak state; findings go out in snapshot().health. */
-    this._healthEval = new HealthEvaluator();
+    this._healthEval = new HealthEvaluator({ lowPowerEnabled: spark?.platform !== "darwin" });
     this._health = [];
     this._prevHealthIds = null;
     // Resolver for worker derived label: maps a head spark id to its live

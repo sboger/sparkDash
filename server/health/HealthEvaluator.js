@@ -45,8 +45,10 @@ function nvidiaView(gpu) {
 }
 
 export class HealthEvaluator {
-  constructor({ now = Date.now } = {}) {
+  constructor({ now = Date.now, lowPowerEnabled = true } = {}) {
     this._now = now;
+    /** Apple Silicon GPUs draw ~0.003-5 W while decoding (memory-bound), so the low-power rule is off for darwin units. */
+    this._lowPowerEnabled = lowPowerEnabled;
     this._lowPowerStreak = 0;
     this._kernel = { xid: null, oom: null };
     this._kernelAt = { xid: 0, oom: 0 };
@@ -95,6 +97,10 @@ export class HealthEvaluator {
   }
 
   _lowPower(gpu, domain, out) {
+    if (!this._lowPowerEnabled) {
+      if (domain === "gpu") this._lowPowerStreak = 0;
+      return;
+    }
     const util = num(gpu?.usage);
     const draw = num(gpu?.power?.draw);
     if (util == null || draw == null) {
