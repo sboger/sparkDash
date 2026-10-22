@@ -2482,9 +2482,22 @@ export class SystemCollector {
     try {
       const j = await this._macmonSample();
       const r1 = (n) => Math.round((Number(n) || 0) * 10) / 10;
+      // A nonzero macmon reading is a real measurement, however small (an idle
+      // Apple GPU measures ~0.003 W at its minimum clock). Only an exact 0 means
+      // the CLPC counter is unmeasured on this chip/macOS build, so the UI shows
+      // "—" for the draw instead of a fake 0 W.
+      const watts = (w) => (Number.isFinite(w) && w > 0 ? Math.round(w * 100) / 100 : null);
       const temperature = r1(j.temp?.gpu_temp_avg);
       const usage = Math.round((Number(j.gpu_usage?.[1]) || 0) * 100);
-      const draw = r1(j.gpu_power);
+      const draw = watts(Number(j.gpu_power));
+      const soc = j.soc && typeof j.soc === "object" ? j.soc : null;
+      const gpuCores = Number.isFinite(Number(soc?.gpu_cores)) && Number(soc.gpu_cores) > 0 ? Number(soc.gpu_cores) : null;
+      const chip = typeof soc?.chip_name === "string" && soc.chip_name ? soc.chip_name : null;
+      // Apple publishes no GPU power limit, so the bar scales against a nominal
+      // envelope of ~2 W per GPU core (an M6's 12-core GPU saturates at ~19-21 W
+      // sustained), rounded to 5 W with a 15 W floor. The caption keeps "—" for
+      // the real limit because this is an estimate, not a published number.
+      const nominalLimit = gpuCores ? Math.max(15, Math.round((gpuCores * 2) / 5) * 5) : null;
       const total = Math.round((Number(j.memory?.ram_total) || 0) / 1048576);
       const used = Math.round((Number(j.memory?.ram_usage) || 0) / 1048576);
       const vram = {
@@ -2496,7 +2509,9 @@ export class SystemCollector {
       const metricAvailability = {
         temperature: temperature > 0,
         usage: true,
-        powerDraw: true,
+        powerDraw: draw != null,
+        // No published limit: the nominal envelope gives the bar a scale, but the
+        // caption must keep "—" (an estimate is not a hardware limit).
         powerLimit: false,
         vramUsed: total > 0,
         vramTotal: total > 0,
@@ -2506,11 +2521,11 @@ export class SystemCollector {
         vendor: "apple",
         index: 0,
         physicalIndex: 0,
-        name: String(j.soc?.chip_name || "Apple GPU"),
+        name: chip ? `${chip} GPU${gpuCores ? ` (${gpuCores} cores)` : ""}` : "Apple GPU",
         uuid: null,
         temperature,
         usage,
-        power: { draw, limit: 0 },
+        power: { draw: draw ?? 0, limit: nominalLimit ?? 0 },
         vram,
         throttle,
         processes: [],
@@ -2519,7 +2534,7 @@ export class SystemCollector {
       return {
         temperature,
         usage,
-        power: { draw, limit: 0, systemDraw: Math.round(Number(j.sys_power) || 0) },
+        power: { draw: draw ?? 0, limit: nominalLimit ?? 0, systemDraw: Math.round(Number(j.sys_power) || 0) },
         vram,
         processes: [],
         throttle,
@@ -2592,6 +2607,45 @@ export class SystemCollector {
     } catch (err) {
       console.error(`[SystemCollector] macOS network error for ${this.spark.id}:`, err.message);
       return this._defaultNetwork();
+    }
+  }
+
+  /**
+   * macOS identity for the unit header: chip and GPU core count from macmon's
+   * soc block, CPU model and memory from sysctl. One SSH round trip.
+   */
+  async detectMacHardware() {
+    try {
+      const out = await sshExec(
+        this.spark,
+        // MACMON_CMD ends with `exit 0`; the subshell keeps it from skipping sysctl.
+        `( ${MACMON_CMD} ); echo '---'; sysctl -n machdep.cpu.brand_string hw.memsize 2>/dev/null`,
+      );
+      const [macOut, sysOut] = out.split("---");
+      const soc = parseMacmonSample(macOut)?.soc ?? null;
+      const chip = typeof soc?.chip_name === "string" && soc.chip_name ? soc.chip_name : null;
+      const gpuCores = Number.isFinite(Number(soc?.gpu_cores)) && Number(soc.gpu_cores) > 0 ? Number(soc.gpu_cores) : null;
+      const lines = String(sysOut ?? "").trim().split("\n");
+      const cpuModel = lines[0]?.trim() || null;
+      const totalBytes = parseInt(lines[1] ?? "", 10) || 0;
+      const socMemory = Number(soc?.memory_gb) > 0 ? Number(soc.memory_gb) : null;
+      const totalMemoryGB = totalBytes > 0 ? Math.max(1, Math.round(totalBytes / 1024 / 1024 / 1024)) : socMemory;
+      const cpuCores =
+        (Number(soc?.pcpu_cores) || 0) + (Number(soc?.ecpu_cores) || 0) > 0
+          ? (Number(soc.pcpu_cores) || 0) + (Number(soc.ecpu_cores) || 0)
+          : null;
+      return {
+        device: "Mac (Apple Silicon)",
+        cpuModel,
+        cpuCores,
+        totalMemoryGB,
+        gpuChip: chip ? `${chip} GPU${gpuCores ? ` (${gpuCores} cores)` : ""}` : null,
+        gpuCount: chip ? 1 : null,
+        cudaDriver: null,
+        storageModel: null,
+      };
+    } catch {
+      return null;
     }
   }
 
